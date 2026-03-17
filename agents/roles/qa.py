@@ -11,7 +11,7 @@ from autogen_agentchat.base import Handoff
 
 from core.autogen_config import get_model_client
 from core.mcp_client import MCPClientPool
-from core.mcp_tools import BOARD_TOOLS, CODE_READ_TOOLS, bind_tools, CODE_WRITE_TOOLS
+from core.mcp_tools import BOARD_TOOLS, bind_tools, CODE_WRITE_TOOLS
 
 
 _SYSTEM_MESSAGE = """\
@@ -52,7 +52,7 @@ class QA:
         self.agent = AssistantAgent(
             name="QA",
             model_client=get_model_client(),
-            tools=bind_tools(pool, *BOARD_TOOLS, *CODE_WRITE_TOOLS, *CODE_READ_TOOLS),
+            tools=bind_tools(pool, *BOARD_TOOLS, *CODE_WRITE_TOOLS),
             handoffs=[
                 Handoff(target="ProjectManager", description="Return control to the ProjectManager when testing is complete."),
             ],
