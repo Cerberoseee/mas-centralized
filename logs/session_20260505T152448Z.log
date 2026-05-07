@@ -1,0 +1,10 @@
+2026-05-05 22:24:48,734 [INFO] __main__: Session log file: /Users/cerberose/Work/mas-centralize/logs/session_20260505T152448Z.log
+2026-05-05 22:24:48,735 [INFO] __main__: Opening MCP connections: ['git', 'fs_code', 'fs_docs', 'fs_board']
+2026-05-05 22:24:48,735 [INFO] core.mcp_client: [MCPClient:git] connecting – mcp-server-git ['--repository', 'runs/example-study/mas_centralize/astropy__astropy-12907/repeat_1/workspace']
+2026-05-05 22:24:48,736 [INFO] core.mcp_client: [MCPClient:fs_code] connecting – npx ['-y', '@modelcontextprotocol/server-filesystem', 'runs/example-study/mas_centralize/astropy__astropy-12907/repeat_1/workspace']
+2026-05-05 22:24:48,737 [INFO] core.mcp_client: [MCPClient:fs_docs] connecting – npx ['-y', '@modelcontextprotocol/server-filesystem', 'runs/example-study/mas_centralize/astropy__astropy-12907/repeat_1/knowledge_base']
+2026-05-05 22:24:48,737 [INFO] core.mcp_client: [MCPClient:fs_board] connecting – npx ['-y', '@modelcontextprotocol/server-filesystem', 'runs/example-study/mas_centralize/astropy__astropy-12907/repeat_1/project_board']
+2026-05-05 22:24:49,734 [INFO] core.mcp_client: [MCPClient:fs_docs] connected
+2026-05-05 22:24:49,734 [INFO] core.mcp_client: [MCPClient:fs_code] connected
+2026-05-05 22:24:49,735 [INFO] core.mcp_client: [MCPClient:fs_board] connected
+2026-05-05 22:24:49,735 [ERROR] core.mcp_client: [MCPClientPool] failed to connect 'git': unhandled errors in a TaskGroup (1 sub-exception)

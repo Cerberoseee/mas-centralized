@@ -12,6 +12,7 @@ from autogen_agentchat.base import Handoff
 from core.autogen_config import get_model_client
 from core.mcp_client import MCPClientPool
 from core.mcp_tools import BOARD_TOOLS, DOCS_TOOLS, CODE_READ_TOOLS, bind_tools
+from core.swebench import get_role_system_message
 
 
 _SYSTEM_MESSAGE = """\
@@ -46,6 +47,7 @@ Other tools available to you:
 - code_read_*   : read the existing codebase (data/workspace/) for context.
 
 Rules:
+- Chain of Thought: Before executing any tool call or handoff, you MUST output your internal reasoning explicitly (e.g., "Thought: First I need to gather context..."). Think step-by-step.
 - Never attempt to read or write paths outside these data/ directories.
 - Do NOT write or modify implementation code.
 - Always call transfer_to_ProjectManager when your work is complete.
@@ -64,5 +66,5 @@ class Architect:
             handoffs=[
                 Handoff(target="ProjectManager", description="Return control to the ProjectManager when design is complete."),
             ],
-            system_message=_SYSTEM_MESSAGE,
+            system_message=get_role_system_message("architect", _SYSTEM_MESSAGE),
         )

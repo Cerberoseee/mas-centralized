@@ -24,7 +24,10 @@ Usage
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +42,8 @@ from agents import ProjectManager, Architect, Engineer, CodeReviewer, QA
 from agents.config import ensure_workspace_dirs
 from core.mcp_client import MCPClientPool
 from core.mcp_config import ROLE_SERVERS
+from core.swebench import build_task_prompt, load_task_context
+from core.telemetry import record_handoff, record_message, reset as reset_telemetry, set_final_status, write_if_configured
 
 load_dotenv()
 
@@ -60,8 +65,10 @@ if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
 # Per-session file handler
 logs_dir = Path(__file__).resolve().parent / "logs"
 logs_dir.mkdir(parents=True, exist_ok=True)
+run_id = os.environ.get("MAS_RUN_ID")
 session_ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-log_file = logs_dir / f"session_{session_ts}.log"
+log_suffix = run_id or session_ts
+log_file = logs_dir / f"session_{log_suffix}.log"
 
 file_handler = logging.FileHandler(log_file, encoding="utf-8")
 file_handler.setFormatter(log_format)
@@ -132,6 +139,13 @@ async def start_sdlc(idea: str, rounds: int = 20) -> str:
         try:
             async for message in team.run_stream(task=idea):
                 if hasattr(message, "content"):
+                    record_message(
+                        getattr(message, "source", "?"),
+                        str(getattr(message, "content", "")),
+                        getattr(message, "models_usage", None),
+                    )
+                    if "handoff" in type(message).__name__.lower() or hasattr(message, "target"):
+                        record_handoff(getattr(message, "source", "?"), getattr(message, "target", None))
                     logger.info(
                         "[%s] %s",
                         getattr(message, "source", "?"),
@@ -153,6 +167,52 @@ async def start_sdlc(idea: str, rounds: int = 20) -> str:
         return final_message
 
 
+def _write_patch_if_configured() -> str | None:
+    patch_path = os.environ.get("MAS_EVAL_PATCH_PATH")
+    workspace = os.environ.get("MAS_WORKSPACE_PATH")
+    if not patch_path or not workspace:
+        return None
+    diff = subprocess.run(
+        ["git", "diff"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    Path(patch_path).write_text(diff, encoding="utf-8")
+    return patch_path
+
+
+def _write_result(final_message: str, patch_path: str | None) -> None:
+    result_path = os.environ.get("MAS_EVAL_RESULT_PATH")
+    if not result_path:
+        return
+    Path(result_path).write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "final_message": final_message,
+                "patch_path": patch_path,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def run_swebench(task_path: str, rounds: int = 100) -> None:
+    os.environ["MAS_MODE"] = "swebench"
+    reset_telemetry()
+    task = load_task_context(task_path)
+    result = asyncio.run(start_sdlc(build_task_prompt(task), rounds=rounds))
+    patch_path = _write_patch_if_configured()
+    set_final_status("success")
+    _write_result(result, patch_path)
+    write_if_configured()
+    print("\n=== SWE-bench result ===")
+    print(result)
+
+
 def main(idea: str, rounds: int = 100) -> None:
     """
     CLI entry point.
@@ -170,4 +230,9 @@ def main(idea: str, rounds: int = 100) -> None:
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    fire.Fire(
+        {
+            "main": main,
+            "run_swebench": run_swebench,
+        }
+    )

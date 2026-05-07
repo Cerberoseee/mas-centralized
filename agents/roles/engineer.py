@@ -17,8 +17,10 @@ from core.mcp_tools import (
     DOCS_TOOLS,
     CODE_WRITE_TOOLS,
     GIT_WRITE_TOOLS,
+    SHELL_TOOLS,
     bind_tools,
 )
+from core.swebench import get_role_system_message
 
 
 _SYSTEM_MESSAGE = """\
@@ -54,6 +56,7 @@ Other tools available to you:
 - git_*         : stage, commit, branch, and inspect the workspace repo.
 
 Rules:
+- Chain of Thought: Before executing any tool call or handoff, you MUST output your internal reasoning explicitly (e.g., "Thought: First I need to implement the models..."). Think step-by-step.
 - Never attempt to read or write paths outside these data/ directories.
 - Do NOT modify files outside the workspace directory.
 - The project board is ticket files. You will be given one or more ticket file
@@ -77,9 +80,9 @@ class Engineer:
         self.agent = AssistantAgent(
             name="Engineer",
             model_client=get_model_client(),
-            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS, *CODE_WRITE_TOOLS, *GIT_WRITE_TOOLS),
+            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS, *CODE_WRITE_TOOLS, *GIT_WRITE_TOOLS, *SHELL_TOOLS),
             handoffs=[
                 Handoff(target="ProjectManager", description="Return control to the ProjectManager when implementation is complete."),
             ],
-            system_message=_SYSTEM_MESSAGE,
+            system_message=get_role_system_message("engineer", _SYSTEM_MESSAGE),
         )

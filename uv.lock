@@ -15,6 +15,7 @@ dependencies = [
     { name = "mcp-server-git" },
     { name = "openai" },
     { name = "python-dotenv" },
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
@@ -27,6 +28,7 @@ requires-dist = [
     { name = "mcp-server-git", specifier = ">=2026.1.14" },
     { name = "openai", specifier = ">=1.60.0,<2.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0,<2.0.0" },
+    { name = "typing-extensions", specifier = ">=4.12.0" },
 ]
 
 [[package]]

@@ -1,0 +1,1509 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+agents/
+  roles/
+    architect.py
+    code_reviewer.py
+    engineer.py
+    project_manager.py
+    qa.py
+  __init__.py
+  config.py
+core/
+  __init__.py
+  autogen_config.py
+  mcp_client.py
+  mcp_config.py
+  mcp_tools.py
+.gitignore
+.python-version
+main.py
+pyproject.toml
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="agents/__init__.py">
+from .roles.project_manager import ProjectManager
+from .roles.architect import Architect
+from .roles.engineer import Engineer
+from .roles.code_reviewer import CodeReviewer
+from .roles.qa import QA
+
+__all__ = [
+    "ProjectManager",
+    "Architect",
+    "Engineer",
+    "CodeReviewer",
+    "QA",
+]
+</file>
+
+<file path="agents/config.py">
+"""
+Path constants shared across agents and tools.
+
+The actual workspace directories are also used by the MCP server
+configurations in core/mcp_config.py.  Keep them in sync.
+"""
+from __future__ import annotations
+
+import os
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../data"))
+
+BOARD_PATH = os.path.join(BASE_DIR, "project_board")
+DOCS_PATH = os.path.join(BASE_DIR, "knowledge_base")
+CODE_PATH = os.path.join(BASE_DIR, "workspace")
+
+
+def ensure_workspace_dirs() -> None:
+    """Create the workspace directories if they do not exist."""
+    for path in [BOARD_PATH, DOCS_PATH, CODE_PATH]:
+        os.makedirs(path, exist_ok=True)
+</file>
+
+<file path="core/__init__.py">
+from .autogen_config import get_model_client
+from .mcp_client import MCPClient, MCPClientPool
+from .mcp_config import MCP_SERVERS, ROLE_SERVERS
+
+__all__ = [
+    "get_model_client",
+    "MCPClient",
+    "MCPClientPool",
+    "MCP_SERVERS",
+    "ROLE_SERVERS",
+]
+</file>
+
+<file path="core/autogen_config.py">
+"""
+Centralised AutoGen / LLM configuration helpers.
+
+Reads model settings from environment variables so they can be overridden
+without touching code.
+"""
+from __future__ import annotations
+
+import os
+
+from autogen_ext.models.openai import OpenAIChatCompletionClient
+
+
+def get_model_client() -> OpenAIChatCompletionClient:
+    """Return a configured OpenAI model client for AutoGen agents."""
+    model = os.environ.get("AUTOGEN_MODEL", "gpt-4o")
+    return OpenAIChatCompletionClient(
+        model=model,
+        api_key=os.environ.get("OPENAI_API_KEY"),
+    )
+</file>
+
+<file path="core/mcp_client.py">
+"""
+Reusable async MCP client layer.
+
+Provides MCPClient (single connection) and MCPClientPool (shared pool of
+named connections, one per MCP server key defined in mcp_config.py).
+
+Usage
+-----
+    async with MCPClientPool(server_keys=["fs_code", "git"]) as pool:
+        tools = await pool.list_tools("fs_code")
+        result = await pool.call_tool("git", "git_status", {})
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+from .mcp_config import MCP_SERVERS
+
+logger = logging.getLogger(__name__)
+
+
+class MCPClient:
+    """
+    Manages a single stdio MCP session.
+
+    The entire connection lifecycle (stdio_client + ClientSession) is run
+    inside a dedicated asyncio Task so that anyio cancel scopes are always
+    entered and exited within the same task — avoiding the
+    "Attempted to exit cancel scope in a different task" RuntimeError that
+    occurs when asyncio.gather() creates sub-tasks for connection setup.
+    """
+
+    def __init__(self, server_key: str) -> None:
+        self._server_key = server_key
+        self._session: ClientSession | None = None
+        self._ready_event: asyncio.Event = asyncio.Event()
+        self._shutdown_event: asyncio.Event = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._connect_error: BaseException | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def _run(self, timeout: float) -> None:
+        """Long-lived task: open the MCP connection, signal ready, then wait for shutdown."""
+        cfg = MCP_SERVERS[self._server_key]
+        params = StdioServerParameters(
+            command=cfg["command"],
+            args=cfg["args"],
+            env=cfg.get("env"),
+        )
+        logger.info("[MCPClient:%s] connecting – %s %s", self._server_key, cfg["command"], cfg["args"])
+        try:
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(session.initialize(), timeout=timeout)
+                    self._session = session
+                    logger.info("[MCPClient:%s] connected", self._server_key)
+                    self._ready_event.set()
+                    await self._shutdown_event.wait()
+        except Exception as exc:
+            self._connect_error = exc
+            self._ready_event.set()
+        finally:
+            self._session = None
+
+    async def connect(self, timeout: float = 30.0) -> None:
+        self._task = asyncio.ensure_future(self._run(timeout))
+        await self._ready_event.wait()
+        if self._connect_error is not None:
+            raise self._connect_error
+
+    async def close(self) -> None:
+        self._shutdown_event.set()
+        if self._task is not None:
+            try:
+                await self._task
+            except Exception as exc:
+                logger.warning("[MCPClient:%s] error during shutdown: %s", self._server_key, exc)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def list_tools(self, timeout: float = 15.0) -> list:
+        """Return tool definitions from the MCP server (best-effort)."""
+        if not self._session:
+            raise RuntimeError(f"MCPClient:{self._server_key} not connected")
+        try:
+            resp = await asyncio.wait_for(self._session.list_tools(), timeout=timeout)
+            return resp.tools
+        except asyncio.TimeoutError:
+            logger.warning("[MCPClient:%s] list_tools timed out", self._server_key)
+            return []
+        except Exception as exc:
+            logger.warning("[MCPClient:%s] list_tools error: %s", self._server_key, exc)
+            return []
+
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        if not self._session:
+            raise RuntimeError(f"MCPClient:{self._server_key} not connected")
+        logger.debug("[MCPClient:%s] call_tool %s %s", self._server_key, tool_name, arguments)
+        return await self._session.call_tool(tool_name, arguments)
+
+
+class MCPClientPool:
+    """
+    Async context manager that owns a pool of named MCPClient instances.
+
+    Parameters
+    ----------
+    server_keys:
+        Subset of keys from mcp_config.MCP_SERVERS to connect on enter.
+        Pass None to connect to all registered servers.
+    """
+
+    def __init__(self, server_keys: list[str] | None = None) -> None:
+        keys = server_keys if server_keys is not None else list(MCP_SERVERS)
+        self._clients: dict[str, MCPClient] = {k: MCPClient(k) for k in keys}
+
+    async def __aenter__(self) -> "MCPClientPool":
+        # Protect against individual MCP servers hanging indefinitely on connect
+        connect_coros = (
+            asyncio.wait_for(c.connect(), timeout=60.0) for c in self._clients.values()
+        )
+        results = await asyncio.gather(*connect_coros, return_exceptions=True)
+
+        errors: dict[str, Exception] = {}
+        for key, result in zip(self._clients.keys(), results):
+            if isinstance(result, Exception):
+                errors[key] = result
+                logger.error(
+                    "[MCPClientPool] failed to connect '%s': %s", key, result
+                )
+
+        if errors:
+            failed = ", ".join(errors.keys())
+            raise RuntimeError(f"Failed to connect MCP servers: {failed}")
+
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        for c in self._clients.values():
+            await c.close()
+
+    # ------------------------------------------------------------------
+    # Delegation helpers
+    # ------------------------------------------------------------------
+
+    def _get(self, server_key: str) -> MCPClient:
+        try:
+            return self._clients[server_key]
+        except KeyError:
+            raise KeyError(f"Server '{server_key}' not in pool. Available: {list(self._clients)}")
+
+    async def list_tools(self, server_key: str) -> list:
+        return await self._get(server_key).list_tools()
+
+    async def call_tool(self, server_key: str, tool_name: str, arguments: dict[str, Any]) -> Any:
+        return await self._get(server_key).call_tool(tool_name, arguments)
+
+    async def list_all_tools(self) -> dict[str, list]:
+        """Return {server_key: [tool, ...]} for every server in the pool."""
+        results = await asyncio.gather(*(c.list_tools() for c in self._clients.values()))
+        return dict(zip(self._clients.keys(), results))
+</file>
+
+<file path=".gitignore">
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env
+data/knowledge_base/*
+data/project_board/*
+data/workspace/*
+
+data/knowledge_base_*
+data/project_board_*
+data/workspace_*
+</file>
+
+<file path=".python-version">
+3.13
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "ai-agents-mcp-client"
+version = "0.1.0"
+description = "AutoGen-based multi-agent SDLC system with MCP tool integration"
+authors = [
+    {name = "Cerberoseee",email = "tranlethaison123@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "autogen-agentchat>=0.7.5,<0.8.0",
+    "autogen-ext[openai]>=0.7.5,<0.8.0",
+    "mcp[cli]>=1.12.0",
+    "openai>=1.60.0,<2.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "fire>=0.6.0,<1.0.0",
+    "colorama>=0.4.6,<0.5.0",
+    "mcp-server-git>=2026.1.14",
+]
+
+[tool.poetry]
+packages = [
+    { include = "core" },
+    { include = "agents" },
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+</file>
+
+<file path="agents/roles/architect.py">
+"""
+Architect agent.
+
+Receives a requirement from the ProjectManager, designs the system
+architecture, documents decisions on the project board, and reports back.
+"""
+from __future__ import annotations
+
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import Handoff
+
+from core.autogen_config import get_model_client
+from core.mcp_client import MCPClientPool
+from core.mcp_tools import BOARD_TOOLS, DOCS_TOOLS, CODE_READ_TOOLS, bind_tools
+
+
+_SYSTEM_MESSAGE = """\
+You are Bob, a System Architect.
+
+Your responsibilities:
+- Read the project board and knowledge base to understand the current state.
+- Design a scalable, secure, and maintainable architecture that satisfies
+  the given requirement.
+- If the code workspace (data/workspace/) is empty or nearly empty, treat the
+  project as greenfield: choose an appropriate tech stack and high-level
+  project structure so the Engineer can scaffold a new codebase.
+- Document your architectural decisions (components, APIs, data flows,
+  technology choices, directory layout) clearly so the Engineer can implement
+  them end-to-end.
+- You may be given ticket file path(s) on the project board (typically under
+  data/project_board/tickets/). Use them as the source of truth for scope and
+  acceptance criteria; add links from tickets to the relevant knowledge base
+  design doc(s) when appropriate.
+- When a new user request arrives, produce or update a design/approach
+  document in the knowledge base (data/knowledge_base/) explaining the chosen
+  architecture and key trade-offs.
+- When your design is complete, hand control back to the ProjectManager using
+  the transfer_to_ProjectManager tool.
+
+Handoff tools available to you:
+- transfer_to_ProjectManager : return control to the ProjectManager when done.
+
+Other tools available to you:
+- board_*       : read from the project board (data/project_board/).
+- docs_*        : read and write the knowledge base (data/knowledge_base/).
+- code_read_*   : read the existing codebase (data/workspace/) for context.
+
+Rules:
+- Never attempt to read or write paths outside these data/ directories.
+- Do NOT write or modify implementation code.
+- Always call transfer_to_ProjectManager when your work is complete.
+"""
+
+
+class Architect:
+    """Constructs an AutoGen AssistantAgent configured for the Architect role."""
+
+    def __init__(self, pool: MCPClientPool) -> None:
+        self._pool = pool
+        self.agent = AssistantAgent(
+            name="Architect",
+            model_client=get_model_client(),
+            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS, *CODE_READ_TOOLS),
+            handoffs=[
+                Handoff(target="ProjectManager", description="Return control to the ProjectManager when design is complete."),
+            ],
+            system_message=_SYSTEM_MESSAGE,
+        )
+</file>
+
+<file path="agents/roles/code_reviewer.py">
+"""
+Code Reviewer agent.
+
+Receives a review request from the ProjectManager, inspects the code and
+diffs, provides actionable feedback, and reports back.
+"""
+from __future__ import annotations
+
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import Handoff
+
+from core.autogen_config import get_model_client
+from core.mcp_client import MCPClientPool
+from core.mcp_tools import BOARD_TOOLS, DOCS_TOOLS, CODE_READ_TOOLS, GIT_READ_TOOLS, bind_tools
+
+
+_SYSTEM_MESSAGE = """\
+You are Dave, a Code Reviewer.
+
+Your responsibilities:
+- Inspect the implementation code and git diffs to evaluate correctness,
+  readability, maintainability, performance, and adherence to standards.
+- Use the knowledge base docs as reference for architecture and conventions.
+- Provide clear, actionable feedback with specific file/line references.
+- If critical issues are found, list them explicitly so the Engineer can
+  address them.
+- You will be given the ticket file path(s) on the project board (typically
+  under data/project_board/tickets/). Update the corresponding ticket file:
+  - If changes are acceptable, move Status to DONE.
+  - If significant issues remain, move Status back to IN PROGRESS and clearly
+    state what must be fixed.
+- When your review is complete, hand control back to the ProjectManager
+  using the transfer_to_ProjectManager tool.
+
+Handoff tools available to you:
+- transfer_to_ProjectManager : return control to the ProjectManager when done.
+
+Other tools available to you:
+- board_*       : read and write the project board (data/project_board/).
+- docs_*        : read from the knowledge base (data/knowledge_base/).
+- code_read_*   : read the implementation code (data/workspace/).
+- git_*         : inspect diffs, commits, and branch state.
+
+Rules:
+- Never attempt to read or write paths outside these data/ directories.
+- Do NOT modify any code files.
+- Always call transfer_to_ProjectManager when your review is complete.
+"""
+
+
+class CodeReviewer:
+    """Constructs an AutoGen AssistantAgent configured for the Code Reviewer role."""
+
+    def __init__(self, pool: MCPClientPool) -> None:
+        self._pool = pool
+        self.agent = AssistantAgent(
+            name="CodeReviewer",
+            model_client=get_model_client(),
+            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS, *CODE_READ_TOOLS, *GIT_READ_TOOLS),
+            handoffs=[
+                Handoff(target="ProjectManager", description="Return control to the ProjectManager when review is complete."),
+            ],
+            system_message=_SYSTEM_MESSAGE,
+        )
+</file>
+
+<file path="agents/roles/engineer.py">
+"""
+Engineer agent.
+
+Receives implementation tasks from the ProjectManager (guided by the
+Architect's design), writes or refactors code in the workspace, commits
+via git, and reports back.
+"""
+from __future__ import annotations
+
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import Handoff
+
+from core.autogen_config import get_model_client
+from core.mcp_client import MCPClientPool
+from core.mcp_tools import (
+    BOARD_TOOLS,
+    DOCS_TOOLS,
+    CODE_WRITE_TOOLS,
+    GIT_WRITE_TOOLS,
+    bind_tools,
+)
+
+
+_SYSTEM_MESSAGE = """\
+You are Charlie, a Software Engineer.
+
+Your responsibilities:
+- Read the project board, knowledge base, and architecture docs to
+  understand the requirement and design.
+- Inspect the code workspace (data/workspace/). If it is empty or nearly
+  empty, treat the project as greenfield: create a complete project structure
+  and all necessary code files using the code_* tools.
+- For a REST API project, you must at minimum:
+  - define the data model(s) (e.g., Todo) in a models/ directory,
+  - implement controllers/ or handlers that contain the business logic,
+  - implement routes/ wiring HTTP paths to controllers,
+  - wire everything through the main server entrypoint,
+  - ensure the CRUD endpoints described in the requirements are fully
+    implemented end-to-end (not just stubbed).
+- Implement, refactor, or extend code in the workspace (data/workspace/) to
+  satisfy the requirement.
+- Follow existing conventions; keep code clean, readable, and testable.
+- Commit your changes via the git tools after implementation.
+- When implementation is complete, hand control back to the ProjectManager
+  using the transfer_to_ProjectManager tool.
+
+Handoff tools available to you:
+- transfer_to_ProjectManager : return control to the ProjectManager when done.
+
+Other tools available to you:
+- board_*       : read and write the project board (data/project_board/).
+- docs_*        : read from the knowledge base (data/knowledge_base/).
+- code_*        : read and write files in the code workspace (data/workspace/).
+- git_*         : stage, commit, branch, and inspect the workspace repo.
+
+Rules:
+- Never attempt to read or write paths outside these data/ directories.
+- Do NOT modify files outside the workspace directory.
+- The project board is ticket files. You will be given one or more ticket file
+  paths (typically under data/project_board/tickets/). Update ONLY those ticket
+  files (and optionally the board index) to reflect reality.
+- When you start work on a ticket, update its Status from TO DO to IN PROGRESS.
+  When you hand work off for review, move the ticket to IN REVIEW. When issues
+  are found in review and sent back, move the ticket back to IN PROGRESS.
+- Avoid leaving TODO comments or unimplemented stubs when you can implement
+  the real logic.
+- Always commit your changes before calling transfer_to_ProjectManager.
+- Always call transfer_to_ProjectManager when your work is complete.
+"""
+
+
+class Engineer:
+    """Constructs an AutoGen AssistantAgent configured for the Engineer role."""
+
+    def __init__(self, pool: MCPClientPool) -> None:
+        self._pool = pool
+        self.agent = AssistantAgent(
+            name="Engineer",
+            model_client=get_model_client(),
+            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS, *CODE_WRITE_TOOLS, *GIT_WRITE_TOOLS),
+            handoffs=[
+                Handoff(target="ProjectManager", description="Return control to the ProjectManager when implementation is complete."),
+            ],
+            system_message=_SYSTEM_MESSAGE,
+        )
+</file>
+
+<file path="agents/roles/project_manager.py">
+"""
+Project Manager agent.
+
+Acts as the central hub of the SDLC.  Receives the initial idea from the
+UserProxy, breaks it into tasks, and dispatches work to Architect, Engineer,
+CodeReviewer, and QA via nested chats.  Each specialist reports back here
+when done.
+"""
+from __future__ import annotations
+
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import Handoff
+
+from core.autogen_config import get_model_client
+from core.mcp_client import MCPClientPool
+from core.mcp_tools import BOARD_TOOLS, DOCS_TOOLS, bind_tools
+
+
+_SYSTEM_MESSAGE = """\
+You are Alice, a seasoned Project Manager.
+
+Your responsibilities:
+- Understand the user's idea or requirement thoroughly.
+- Break the work into clear, actionable tasks for the rest of the team
+  (Architect, Engineer, CodeReviewer, QA).
+- Delegate each task to the appropriate specialist using the transfer_to_*
+  handoff tools, then wait for the specialist to hand control back to you
+  before deciding the next step.
+- Synthesise all specialist results into a coherent final summary
+  when the project is complete.
+- For each user request, create one or more tickets as SEPARATE FILES on the
+  project board (data/project_board/). The board is a ticketing system, not a
+  single "whiteboard" document.
+- Store tickets under: data/project_board/tickets/
+- Maintain a lightweight index at: data/project_board/index.md
+  - The index is a directory of tickets (ID, Title, Status, Owner, Links).
+  - Do not put full ticket content in the index; keep details inside each ticket file.
+- Maintain a simple Kanban-style workflow with statuses:
+  TO DO, IN PROGRESS, IN REVIEW, DONE.
+- Ensure ticket statuses reflect reality as work progresses.
+- Ensure each ticket links to relevant knowledge base docs and code paths.
+- When delegating to specialists, ALWAYS include the exact ticket file path(s)
+  they must update (e.g., data/project_board/tickets/T-20260316-001-short-slug.md).
+- Together with the Architect, document the agreed approach and design for
+  each user request in the knowledge base (data/knowledge_base/).
+
+Handoff tools available to you:
+- transfer_to_Architect    : delegate system design work.
+- transfer_to_Engineer     : delegate implementation work.
+- transfer_to_CodeReviewer : delegate code review.
+- transfer_to_QA           : delegate testing and validation.
+
+Other tools available to you:
+- board_*  : read and write files in the project board (data/project_board/).
+- docs_*   : read documentation and knowledge base files (data/knowledge_base/).
+
+Rules:
+- Never attempt to read or write paths outside these data/ directories.
+- Do NOT write or modify code directly.
+- Always use a transfer_to_* tool to delegate; never just address a specialist
+  by name in plain text.
+- Ticket file naming:
+  - Use stable IDs with sortable filenames, e.g.:
+    - data/project_board/tickets/T-YYYYMMDD-###-short-slug.md
+  - Never overwrite a ticket by reusing an existing ID for a different request.
+- Ticket template (minimum required fields in every ticket file):
+  - ID:
+  - Title:
+  - Status: TO DO | IN PROGRESS | IN REVIEW | DONE
+  - Owner: (role or person)
+  - Description:
+  - Acceptance Criteria: (bulleted, testable)
+  - Tasks: (checklist-style; can reference specialist ownership)
+  - Links: (knowledge base docs and code paths)
+  - Updates / History: (brief timestamped notes as status changes)
+- When creating/updating tickets, keep them small and actionable; split work
+  into multiple tickets when it reduces coupling and improves parallelism.
+- Always confirm a specialist has handed back to you before delegating the
+  next task.
+- When all tasks are complete, respond with a final summary that begins
+  with the exact text: "PROJECT COMPLETE".
+"""
+
+
+class ProjectManager:
+    """Constructs an AutoGen AssistantAgent configured for the PM role."""
+
+    def __init__(self, pool: MCPClientPool) -> None:
+        self._pool = pool
+        self.agent = AssistantAgent(
+            name="ProjectManager",
+            model_client=get_model_client(),
+            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS),
+            handoffs=[
+                Handoff(target="Architect", description="Delegate system design to the Architect."),
+                Handoff(target="Engineer", description="Delegate implementation to the Engineer."),
+                Handoff(target="CodeReviewer", description="Delegate code review to the CodeReviewer."),
+                Handoff(target="QA", description="Delegate testing and validation to QA."),
+            ],
+            system_message=_SYSTEM_MESSAGE,
+        )
+</file>
+
+<file path="core/mcp_config.py">
+"""
+MCP server configurations for each logical domain.
+
+Each entry maps a server key to the command + args needed to launch
+the corresponding MCP stdio server.  Paths are resolved at import time
+from the same BASE_DIR used by agents/config.py so every piece of code
+references the same workspace folders.
+"""
+from __future__ import annotations
+
+import os
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data"))
+
+BOARD_PATH = os.path.join(BASE_DIR, "project_board")
+DOCS_PATH = os.path.join(BASE_DIR, "knowledge_base")
+CODE_PATH = os.path.join(BASE_DIR, "workspace")
+
+# ---------------------------------------------------------------------------
+# Server registry
+# Each value is passed directly to StdioServerParameters(command=, args=).
+# ---------------------------------------------------------------------------
+
+MCP_SERVERS: dict[str, dict] = {
+    # @modelcontextprotocol/server-filesystem instances – one per scoped root.
+    "fs_board": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", BOARD_PATH],
+    },
+    "fs_docs": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", DOCS_PATH],
+    },
+    "fs_code": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", CODE_PATH],
+    },
+    # mcp-server-git (pip install mcp-server-git)
+    "git": {
+        "command": "mcp-server-git",
+        "args": ["--repository", CODE_PATH],
+    },
+}
+
+# Convenience: which server keys each role may access.
+ROLE_SERVERS: dict[str, list[str]] = {
+    "project_manager": ["fs_board", "fs_docs"],
+    "architect": ["fs_board", "fs_docs", "fs_code"],
+    "engineer": ["fs_board", "fs_docs", "fs_code", "git"],
+    "code_reviewer": ["fs_docs", "fs_code", "git"],
+    "qa": ["fs_board", "fs_code"],
+}
+</file>
+
+<file path="core/mcp_tools.py">
+"""
+Thin MCP-backed tool wrappers for AutoGen agents.
+
+These functions are simple adapters:
+- AutoGen sees them as Python tools.
+- Internally they call MCP servers via `MCPClientPool.call_tool`.
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+import inspect
+import os
+from typing import Any, Callable
+
+from core.mcp_client import MCPClientPool
+
+
+BOARD_ROOT = "data/project_board"
+DOCS_ROOT = "data/knowledge_base"
+CODE_ROOT = "data/workspace"
+
+
+def _ensure_under_root(path: str, root: str) -> str:
+    """Normalize tool paths so they are always under the configured root."""
+    if not path or path in (".", "/"):
+        return root
+    # Already rooted
+    if path.startswith(root + "/") or path == root:
+        return path
+    # Strip leading slash and join under root
+    return f"{root}/{path.lstrip('/')}"
+
+
+async def _fs_call(pool: MCPClientPool, server_key: str, tool: str, args: dict[str, Any]) -> Any:
+    result = await pool.call_tool(server_key, tool, args)
+    # MCP results carry content blocks; unwrap text for simplicity.
+    if hasattr(result, "content"):
+        blocks = result.content
+        if blocks and hasattr(blocks[0], "text"):
+            return blocks[0].text
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Filesystem tools (server-filesystem MCP)
+# ---------------------------------------------------------------------------
+
+async def board_read_file(pool: MCPClientPool, path: str) -> str:
+    """Read a ticket or document from the project board (data/project_board/)."""
+    norm = _ensure_under_root(path, BOARD_ROOT)
+    return await _fs_call(pool, "fs_board", "read_file", {"path": norm})
+
+
+async def board_write_file(pool: MCPClientPool, path: str, content: str) -> str:
+    """Create or update a ticket/document on the project board."""
+    norm = _ensure_under_root(path, BOARD_ROOT)
+    return await _fs_call(pool, "fs_board", "write_file", {"path": norm, "content": content})
+
+
+async def board_create_directory(pool: MCPClientPool, path: str) -> str:
+    """Create a directory on the project board."""
+    norm = _ensure_under_root(path, BOARD_ROOT)
+    return await _fs_call(pool, "fs_board", "create_directory", {"path": norm})
+
+
+async def board_list_directory(pool: MCPClientPool, path: str = "") -> str:
+    """List entries on the project board."""
+    norm = _ensure_under_root(path, BOARD_ROOT)
+    return await _fs_call(pool, "fs_board", "list_directory", {"path": norm})
+
+
+async def board_get_file_info(pool: MCPClientPool, path: str) -> str:
+    """Get metadata for a board path."""
+    norm = _ensure_under_root(path, BOARD_ROOT)
+    return await _fs_call(pool, "fs_board", "get_file_info", {"path": norm})
+
+
+async def board_read_multiple_files(pool: MCPClientPool, paths: list[str]) -> str:
+    """Read multiple board files at once."""
+    norm_paths = [_ensure_under_root(p, BOARD_ROOT) for p in paths]
+    return await _fs_call(pool, "fs_board", "read_multiple_files", {"paths": norm_paths})
+
+
+async def docs_read_file(pool: MCPClientPool, path: str) -> str:
+    """Read a knowledge-base document (data/knowledge_base/)."""
+    norm = _ensure_under_root(path, DOCS_ROOT)
+    return await _fs_call(pool, "fs_docs", "read_file", {"path": norm})
+
+
+async def docs_write_file(pool: MCPClientPool, path: str, content: str) -> str:
+    """Create or update a knowledge-base document."""
+    norm = _ensure_under_root(path, DOCS_ROOT)
+    return await _fs_call(pool, "fs_docs", "write_file", {"path": norm, "content": content})
+
+
+async def docs_create_directory(pool: MCPClientPool, path: str) -> str:
+    """Create a directory in the knowledge base."""
+    norm = _ensure_under_root(path, DOCS_ROOT)
+    return await _fs_call(pool, "fs_docs", "create_directory", {"path": norm})
+
+
+async def docs_list_directory(pool: MCPClientPool, path: str = "") -> str:
+    """List entries in the knowledge base."""
+    norm = _ensure_under_root(path, DOCS_ROOT)
+    return await _fs_call(pool, "fs_docs", "list_directory", {"path": norm})
+
+
+async def docs_get_file_info(pool: MCPClientPool, path: str) -> str:
+    """Get metadata for a knowledge-base path."""
+    norm = _ensure_under_root(path, DOCS_ROOT)
+    return await _fs_call(pool, "fs_docs", "get_file_info", {"path": norm})
+
+
+async def docs_read_multiple_files(pool: MCPClientPool, paths: list[str]) -> str:
+    """Read multiple knowledge-base files at once."""
+    norm_paths = [_ensure_under_root(p, DOCS_ROOT) for p in paths]
+    return await _fs_call(pool, "fs_docs", "read_multiple_files", {"paths": norm_paths})
+
+
+async def code_read_file(pool: MCPClientPool, path: str) -> str:
+    norm = _ensure_under_root(path, CODE_ROOT)
+    return await _fs_call(pool, "fs_code", "read_file", {"path": norm})
+
+
+async def code_list_directory(pool: MCPClientPool, path: str = "") -> str:
+    norm = _ensure_under_root(path, CODE_ROOT)
+    return await _fs_call(pool, "fs_code", "list_directory", {"path": norm})
+
+
+async def code_get_file_info(pool: MCPClientPool, path: str) -> str:
+    norm = _ensure_under_root(path, CODE_ROOT)
+    return await _fs_call(pool, "fs_code", "get_file_info", {"path": norm})
+
+
+async def code_read_multiple_files(pool: MCPClientPool, paths: list[str]) -> str:
+    norm_paths = [_ensure_under_root(p, CODE_ROOT) for p in paths]
+    return await _fs_call(pool, "fs_code", "read_multiple_files", {"paths": norm_paths})
+
+
+async def code_write_file(pool: MCPClientPool, path: str, content: str) -> str:
+    norm = _ensure_under_root(path, CODE_ROOT)
+    return await _fs_call(pool, "fs_code", "write_file", {"path": norm, "content": content})
+
+
+async def code_create_directory(pool: MCPClientPool, path: str) -> str:
+    norm = _ensure_under_root(path, CODE_ROOT)
+    return await _fs_call(pool, "fs_code", "create_directory", {"path": norm})
+
+
+async def code_move_file(pool: MCPClientPool, source: str, destination: str) -> str:
+    norm_src = _ensure_under_root(source, CODE_ROOT)
+    norm_dst = _ensure_under_root(destination, CODE_ROOT)
+    return await _fs_call(pool, "fs_code", "move_file", {"source": norm_src, "destination": norm_dst})
+
+
+async def code_search_files(pool: MCPClientPool, path: str, pattern: str) -> str:
+    norm = _ensure_under_root(path, CODE_ROOT)
+    return await _fs_call(pool, "fs_code", "search_files", {"path": norm, "pattern": pattern})
+
+
+BOARD_TOOLS = [
+    board_read_file,
+    board_write_file,
+    board_create_directory,
+    board_list_directory,
+    board_get_file_info,
+    board_read_multiple_files,
+]
+
+DOCS_TOOLS = [
+    docs_read_file,
+    docs_write_file,
+    docs_create_directory,
+    docs_list_directory,
+    docs_get_file_info,
+    docs_read_multiple_files,
+]
+
+CODE_READ_TOOLS = [
+    code_read_file,
+    code_list_directory,
+    code_get_file_info,
+    code_read_multiple_files,
+    code_search_files,
+]
+
+CODE_WRITE_TOOLS = [
+    *CODE_READ_TOOLS,
+    code_write_file,
+    code_create_directory,
+    code_move_file,
+]
+
+
+# ---------------------------------------------------------------------------
+# Git tools (mcp-server-git)
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+async def _git_call(pool: MCPClientPool, tool: str, args: dict[str, Any]) -> str:
+    # mcp-server-git (recent versions) expects a repo_path argument for most tools.
+    # Default to this repository root so agents don't need to thread it through.
+    args.setdefault("repo_path", REPO_ROOT)
+    result = await pool.call_tool("git", tool, args)
+    if hasattr(result, "content"):
+        blocks = result.content
+        if blocks and hasattr(blocks[0], "text"):
+            return blocks[0].text
+    return str(result)
+
+
+async def git_status(pool: MCPClientPool) -> str:
+    return await _git_call(pool, "git_status", {})
+
+
+async def git_diff_unstaged(pool: MCPClientPool) -> str:
+    return await _git_call(pool, "git_diff_unstaged", {})
+
+
+async def git_diff_staged(pool: MCPClientPool) -> str:
+    return await _git_call(pool, "git_diff_staged", {})
+
+
+async def git_diff(pool: MCPClientPool, target: str) -> str:
+    return await _git_call(pool, "git_diff", {"target": target})
+
+
+async def git_log(pool: MCPClientPool, max_count: int = 10) -> str:
+    return await _git_call(pool, "git_log", {"max_count": max_count})
+
+
+async def git_show(pool: MCPClientPool, revision: str) -> str:
+    return await _git_call(pool, "git_show", {"revision": revision})
+
+
+async def git_add(pool: MCPClientPool, files: list[str]) -> str:
+    return await _git_call(pool, "git_add", {"files": files})
+
+
+async def git_commit(pool: MCPClientPool, message: str) -> str:
+    return await _git_call(pool, "git_commit", {"message": message})
+
+
+async def git_create_branch(pool: MCPClientPool, branch_name: str, start_point: str | None = None) -> str:
+    args: dict[str, Any] = {"branch_name": branch_name}
+    if start_point:
+        args["start_point"] = start_point
+    return await _git_call(pool, "git_create_branch", args)
+
+
+async def git_checkout(pool: MCPClientPool, branch_name: str) -> str:
+    return await _git_call(pool, "git_checkout", {"branch_name": branch_name})
+
+
+GIT_READ_TOOLS = [
+    git_status,
+    git_diff_unstaged,
+    git_diff_staged,
+    git_diff,
+    git_log,
+    git_show,
+]
+
+GIT_WRITE_TOOLS = [
+    *GIT_READ_TOOLS,
+    git_add,
+    git_commit,
+    git_create_branch,
+    git_checkout,
+]
+
+
+# ---------------------------------------------------------------------------
+# bind_tools helper (captures MCPClientPool for AutoGen)
+# ---------------------------------------------------------------------------
+
+def bind_tools(pool: MCPClientPool, *tool_fns: Callable) -> list[Callable]:
+    """
+    Bind `pool` as the first argument of each tool function and return a list
+    of AutoGen-compatible async callables.
+
+    The returned callables:
+    - keep the original ``__name__`` and ``__doc__``
+    - have a signature that matches everything *after* the ``pool`` parameter
+    - are always async (sync functions are wrapped with asyncio.to_thread)
+    """
+    bound: list[Callable] = []
+    for fn in tool_fns:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        inner_params = params[1:]  # drop the pool param
+        new_sig = sig.replace(parameters=inner_params)
+
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def _async_wrapper(*args: Any, _fn=fn, _pool=pool, **kwargs: Any) -> Any:
+                return await _fn(_pool, *args, **kwargs)
+
+            _async_wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
+            bound.append(_async_wrapper)
+        else:
+
+            @functools.wraps(fn)
+            async def _sync_wrapper(*args: Any, _fn=fn, _pool=pool, **kwargs: Any) -> Any:
+                return await asyncio.to_thread(_fn, _pool, *args, **kwargs)
+
+            _sync_wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
+            bound.append(_sync_wrapper)
+
+    return bound
+
+
+__all__ = [
+    "BOARD_TOOLS",
+    "DOCS_TOOLS",
+    "CODE_READ_TOOLS",
+    "CODE_WRITE_TOOLS",
+    "GIT_READ_TOOLS",
+    "GIT_WRITE_TOOLS",
+    "bind_tools",
+]
+</file>
+
+<file path="main.py">
+"""
+SDLC entry point.
+
+Orchestrates the AutoGen hub-and-spoke multi-agent workflow:
+
+    UserProxy  →  ProjectManager  ↔  Architect
+                                  ↔  Engineer
+                                  ↔  CodeReviewer
+                                  ↔  QA
+
+The ProjectManager is the central hub.  It receives the user idea, delegates
+tasks to each specialist via explicit handoffs (transfer_to_* tools), and each
+specialist hands control back to the PM when done.  The PM decides next steps
+at every stage.
+
+The team uses AutoGen's Swarm pattern: agents transfer control to each other
+via HandoffMessage rather than taking turns blindly.
+
+Usage
+-----
+    uv run main.py "Build a REST API for a todo app"
+    uv run main.py "Build a REST API for a todo app" --rounds 10
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime
+from pathlib import Path
+
+import fire
+from dotenv import load_dotenv
+
+from autogen_agentchat.agents import UserProxyAgent
+from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination
+from autogen_agentchat.teams import Swarm
+
+from agents import ProjectManager, Architect, Engineer, CodeReviewer, QA
+from agents.config import ensure_workspace_dirs
+from core.mcp_client import MCPClientPool
+from core.mcp_config import ROLE_SERVERS
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging: mirror all logs to a per-session file under data/logs/
+# ---------------------------------------------------------------------------
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+log_format = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# Console handler (stderr/stdout)
+if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_format)
+    root_logger.addHandler(console_handler)
+
+# Per-session file handler
+logs_dir = Path(__file__).resolve().parent / "logs"
+logs_dir.mkdir(parents=True, exist_ok=True)
+session_ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+log_file = logs_dir / f"session_{session_ts}.log"
+
+file_handler = logging.FileHandler(log_file, encoding="utf-8")
+file_handler.setFormatter(log_format)
+root_logger.addHandler(file_handler)
+
+logger = logging.getLogger(__name__)
+logger.info("Session log file: %s", log_file)
+
+
+async def start_sdlc(idea: str, rounds: int = 20) -> str:
+    """
+    Run the SDLC multi-agent workflow for the given idea.
+
+    Parameters
+    ----------
+    idea:
+        The project idea or user requirement to implement.
+    rounds:
+        Maximum number of agent messages before the workflow stops.
+
+    Returns
+    -------
+    str
+        The final message from the workflow (typically the PM's summary).
+    """
+    ensure_workspace_dirs()
+
+    # Collect the union of all server keys needed by any role.
+    all_server_keys: list[str] = list(
+        {key for keys in ROLE_SERVERS.values() for key in keys}
+    )
+
+    logger.info("Opening MCP connections: %s", all_server_keys)
+
+    async with MCPClientPool(server_keys=all_server_keys) as pool:
+        # --- Instantiate role agents ---
+        pm = ProjectManager(pool)
+        arch = Architect(pool)
+        eng = Engineer(pool)
+        reviewer = CodeReviewer(pool)
+        qa = QA(pool)
+
+        # --- Termination conditions ---
+        # Stop when the PM says the project is complete OR we hit the round cap.
+        termination = (
+            TextMentionTermination("PROJECT COMPLETE")
+            | MaxMessageTermination(max_messages=rounds)
+        )
+
+        # --- Hub-and-spoke team (Swarm) ---
+        # Swarm routes control via HandoffMessage: PM uses transfer_to_* tools
+        # to delegate to specialists; each specialist transfers back to PM.
+        # The initial task is delivered to the first participant (PM).
+        team = Swarm(
+            participants=[
+                pm.agent,
+                arch.agent,
+                eng.agent,
+                reviewer.agent,
+                qa.agent,
+            ],
+            termination_condition=termination,
+        )
+
+        logger.info("Starting SDLC for: %s", idea)
+
+        final_message = ""
+        try:
+            async for message in team.run_stream(task=idea):
+                if hasattr(message, "content"):
+                    logger.info(
+                        "[%s] %s",
+                        getattr(message, "source", "?"),
+                        str(message.content)[:200],
+                    )
+                    final_message = str(message.content)
+        except Exception as exc:  # noqa: BLE001
+            # AutoGen may raise an internal termination-related exception when
+            # the termination condition is satisfied. Treat that as a graceful
+            # shutdown and still consider the workflow "done" for this run.
+            logger.info(
+                "SDLC workflow stopped due to %s: %s. Assuming all planned steps are done.",
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            logger.info("SDLC workflow finished.")
+
+        return final_message
+
+
+def main(idea: str, rounds: int = 100) -> None:
+    """
+    CLI entry point.
+
+    Parameters`
+    ----------
+    idea:
+        The project idea or user requirement to implement.
+    rounds:
+        Maximum number of agent messages (default: 100).
+    """
+    result = asyncio.run(start_sdlc(idea, rounds=rounds))
+    print("\n=== Final result ===")
+    print(result)
+
+
+if __name__ == "__main__":
+    fire.Fire(main)
+</file>
+
+<file path="README.md">
+# mas-centralize
+
+An AutoGen-based multi-agent system that runs a full Software Development Life Cycle (SDLC) workflow from a single natural-language idea. A team of AI agents — each with a distinct role and access to scoped MCP tool servers — collaborates to plan, design, implement, review, and QA software projects autonomously.
+
+---
+
+## How it works
+
+The system uses a **hub-and-spoke** architecture built on [AutoGen](https://microsoft.github.io/autogen/) `RoundRobinGroupChat`. The **Project Manager** is the central hub; all other agents report to and receive tasks from it.
+
+```
+User idea
+    │
+    ▼
+ProjectManager (Alice) ──── Architect (Bob)
+        │                ── Engineer (Charlie)
+        │                ── CodeReviewer (Diana)
+        └────────────────── QA (Eve)
+```
+
+Each agent is backed by an LLM and has access to a curated set of [MCP](https://modelcontextprotocol.io/) tool servers that scope what it can read and write.
+
+### Agent roles
+
+| Agent | Persona | Responsibilities | MCP access |
+|---|---|---|---|
+| **ProjectManager** | Alice | Breaks down ideas into tickets, drives the team, writes the final summary | `fs_board`, `fs_docs` |
+| **Architect** | Bob | Produces system design and architecture docs | `fs_board`, `fs_docs`, `fs_code` |
+| **Engineer** | Charlie | Implements code in the workspace, commits via git | `fs_board`, `fs_docs`, `fs_code`, `git` |
+| **CodeReviewer** | Diana | Reviews code for quality, correctness, and conventions | `fs_docs`, `fs_code`, `git` |
+| **QA** | Eve | Tests the implementation and reports results | `fs_board`, `fs_code` |
+
+### MCP servers
+
+| Key | Server | Scoped path |
+|---|---|---|
+| `fs_board` | `@modelcontextprotocol/server-filesystem` | `data/project_board/` |
+| `fs_docs` | `@modelcontextprotocol/server-filesystem` | `data/knowledge_base/` |
+| `fs_code` | `@modelcontextprotocol/server-filesystem` | `data/workspace/` |
+| `git` | `mcp-server-git` | `data/workspace/` |
+
+---
+
+## Project structure
+
+```
+mas-centralize/
+├── main.py                  # CLI entry point & SDLC orchestration
+├── agents/
+│   ├── __init__.py
+│   ├── config.py            # Workspace directory setup
+│   └── roles/
+│       ├── project_manager.py
+│       ├── architect.py
+│       ├── engineer.py
+│       ├── code_reviewer.py
+│       └── qa.py
+├── core/
+│   ├── mcp_client.py        # MCPClient / MCPClientPool (async lifecycle management)
+│   ├── mcp_config.py        # MCP server registry & role-to-server mapping
+│   ├── mcp_tools.py         # Tool bindings exposed to AutoGen agents
+│   └── autogen_config.py    # LLM model client configuration
+├── data/
+│   ├── workspace/           # Agent-generated code lives here (git-tracked)
+│   ├── project_board/       # Kanban tickets written by the PM
+│   └── knowledge_base/      # Architecture and design docs
+├── logs/                    # Per-session log files
+├── .env                     # API keys and model config (not committed)
+└── pyproject.toml
+```
+
+---
+
+## Prerequisites
+
+- **Python 3.13+**
+- **Node.js 18+** (for `npx`-based MCP servers)
+- **uv** (`pip install uv`)
+- **mcp-server-git** (`pip install mcp-server-git`)
+- An **OpenAI API key**
+
+---
+
+## Setup
+
+**1. Clone and install dependencies**
+
+```bash
+git clone <repo-url>
+cd mas-centralize
+uv sync
+```
+
+**2. Configure environment variables**
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+```env
+OPENAI_API_KEY=sk-...
+
+# Model to use (default: gpt-4o)
+AUTOGEN_MODEL=gpt-4o
+
+# LLM temperature (default: 0.1)
+AUTOGEN_TEMPERATURE=0.1
+```
+
+**3. Initialise the workspace git repo** (first run only, **required for git MCP tools**)
+
+```bash
+git init data/workspace
+```
+
+---
+
+## Usage
+
+```bash
+uv run python main.py "<your idea>" [--rounds N]
+```
+
+| Argument | Description | Default |
+|---|---|---|
+| `idea` | Natural-language description of what to build | *(required)* |
+| `--rounds` | Maximum number of agent messages before the workflow stops | `50` |
+
+### Examples
+
+```bash
+# Build a CLI todo app
+uv run python main.py "Build a CLI Todo App with JSON storage"
+
+# Build a REST API with a limited number of agent turns
+uv run python main.py "Build a REST API for a blog" --rounds 30
+```
+
+The workflow stops automatically when the ProjectManager outputs `PROJECT COMPLETE` or the round limit is reached.
+
+### Output
+
+- **Terminal** — live log of every agent message
+- **`logs/session_<timestamp>.log`** — full session log persisted to disk
+- **`data/workspace/`** — all generated source code, committed to git
+- **`data/project_board/`** — Kanban tickets tracking the work
+- **`data/knowledge_base/`** — architecture and design documents
+
+---
+
+## Development
+
+### Running with a different model
+
+Set `AUTOGEN_MODEL` in `.env` to any OpenAI-compatible model name (e.g. `gpt-4o`, `gpt-4-turbo`).
+
+### Adding a new agent role
+
+1. Create `agents/roles/<role>.py` following the pattern of existing roles.
+2. Add the new class to `agents/__init__.py`.
+3. Register the role's allowed MCP servers in `core/mcp_config.py` under `ROLE_SERVERS`.
+4. Instantiate the agent in `main.py` and add it to the `RoundRobinGroupChat` participants list.
+
+### Adding a new MCP server
+
+Add an entry to `MCP_SERVERS` in `core/mcp_config.py`:
+
+```python
+"my_server": {
+    "command": "npx",
+    "args": ["-y", "@my-org/mcp-server", "/some/path"],
+},
+```
+
+Then list it under the relevant roles in `ROLE_SERVERS`.
+</file>
+
+<file path="agents/roles/qa.py">
+"""
+QA agent.
+
+Receives a validation request from the ProjectManager, designs and executes
+tests, and reports results.
+"""
+from __future__ import annotations
+
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import Handoff
+
+from core.autogen_config import get_model_client
+from core.mcp_client import MCPClientPool
+from core.mcp_tools import BOARD_TOOLS, bind_tools, CODE_WRITE_TOOLS
+
+
+_SYSTEM_MESSAGE = """\
+You are Eve, a QA Engineer.
+
+Your responsibilities:
+- Inspect the project board and the implemented code to understand what
+  should be tested.
+- Design test cases covering happy paths, edge cases, and regressions.
+- Document your test results clearly, listing any failures or quality
+  concerns.
+- You will be given the ticket file path(s) on the project board (typically
+  under data/project_board/tickets/). When you finish validating a ticket,
+  add a brief summary of test results to that ticket file and make sure the
+  Status accurately reflects whether the work is DONE or needs further changes.
+- When all testing is complete, hand control back to the ProjectManager
+  using the transfer_to_ProjectManager tool.
+
+Handoff tools available to you:
+- transfer_to_ProjectManager : return control to the ProjectManager when done.
+
+Other tools available to you:
+- board_*       : read and write the project board (data/project_board/).
+- code_read_*   : read the implementation code (data/workspace/).
+
+Rules:
+- Never attempt to read or write paths outside these data/ directories.
+- Do NOT modify implementation code.
+- Always call transfer_to_ProjectManager when all testing is complete.
+"""
+
+
+class QA:
+    """Constructs an AutoGen AssistantAgent configured for the QA role."""
+
+    def __init__(self, pool: MCPClientPool) -> None:
+        self._pool = pool
+        self.agent = AssistantAgent(
+            name="QA",
+            model_client=get_model_client(),
+            tools=bind_tools(pool, *BOARD_TOOLS, *CODE_WRITE_TOOLS),
+            handoffs=[
+                Handoff(target="ProjectManager", description="Return control to the ProjectManager when testing is complete."),
+            ],
+            system_message=_SYSTEM_MESSAGE,
+        )
+</file>
+
+</files>

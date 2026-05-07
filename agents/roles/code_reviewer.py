@@ -12,6 +12,7 @@ from autogen_agentchat.base import Handoff
 from core.autogen_config import get_model_client
 from core.mcp_client import MCPClientPool
 from core.mcp_tools import BOARD_TOOLS, DOCS_TOOLS, CODE_READ_TOOLS, GIT_READ_TOOLS, bind_tools
+from core.swebench import get_role_system_message
 
 
 _SYSTEM_MESSAGE = """\
@@ -42,6 +43,7 @@ Other tools available to you:
 - git_*         : inspect diffs, commits, and branch state.
 
 Rules:
+- Chain of Thought: Before executing any tool call or handoff, you MUST output your internal reasoning explicitly (e.g., "Thought: First I need to review the diffs..."). Think step-by-step.
 - Never attempt to read or write paths outside these data/ directories.
 - Do NOT modify any code files.
 - Always call transfer_to_ProjectManager when your review is complete.
@@ -60,5 +62,5 @@ class CodeReviewer:
             handoffs=[
                 Handoff(target="ProjectManager", description="Return control to the ProjectManager when review is complete."),
             ],
-            system_message=_SYSTEM_MESSAGE,
+            system_message=get_role_system_message("code_reviewer", _SYSTEM_MESSAGE),
         )

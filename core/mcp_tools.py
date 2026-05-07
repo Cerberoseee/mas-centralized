@@ -11,29 +11,56 @@ import asyncio
 import functools
 import inspect
 import os
+import shlex
+import subprocess
 from typing import Any, Callable
 
 from core.mcp_client import MCPClientPool
+from core.mcp_config import BOARD_PATH, CODE_PATH, DOCS_PATH
+from core.telemetry import record_tool_event
 
 
-BOARD_ROOT = "data/project_board"
-DOCS_ROOT = "data/knowledge_base"
-CODE_ROOT = "data/workspace"
+BOARD_PREFIXES = ("data/project_board", "project_board")
+DOCS_PREFIXES = ("data/knowledge_base", "knowledge_base")
+CODE_PREFIXES = ("data/workspace", "workspace")
 
 
-def _ensure_under_root(path: str, root: str) -> str:
-    """Normalize tool paths so they are always under the configured root."""
-    if not path or path in (".", "/"):
+def _normalize_scoped_path(path: str, prefixes: tuple[str, ...], root: str) -> str:
+    """Normalize a tool path into an absolute path under the configured root."""
+    if not path:
         return root
-    # Already rooted
-    if path.startswith(root + "/") or path == root:
-        return path
-    # Strip leading slash and join under root
-    return f"{root}/{path.lstrip('/')}"
+
+    normalized = path.replace("\\", "/").strip()
+    if normalized in (".", "/"):
+        return root
+
+    normalized = normalized.lstrip("/")
+    for prefix in prefixes:
+        if normalized == prefix:
+            return root
+        if normalized.startswith(prefix + "/"):
+            normalized = normalized[len(prefix) + 1 :]
+            break
+
+    cleaned = os.path.normpath(normalized).replace("\\", "/")
+    if cleaned in ("", "."):
+        return root
+    if cleaned.startswith("../") or cleaned == "..":
+        raise ValueError(f"Path '{path}' escapes the scoped root.")
+
+    candidate = os.path.abspath(os.path.join(root, cleaned))
+    if os.path.commonpath([candidate, root]) != root:
+        raise ValueError(f"Path '{path}' escapes the scoped root.")
+    return candidate
 
 
 async def _fs_call(pool: MCPClientPool, server_key: str, tool: str, args: dict[str, Any]) -> Any:
-    result = await pool.call_tool(server_key, tool, args)
+    try:
+        result = await pool.call_tool(server_key, tool, args)
+        record_tool_event(tool, True, server_key=server_key)
+    except Exception as exc:
+        record_tool_event(tool, False, server_key=server_key, error=str(exc))
+        raise
     # MCP results carry content blocks; unwrap text for simplicity.
     if hasattr(result, "content"):
         blocks = result.content
@@ -48,115 +75,155 @@ async def _fs_call(pool: MCPClientPool, server_key: str, tool: str, args: dict[s
 
 async def board_read_file(pool: MCPClientPool, path: str) -> str:
     """Read a ticket or document from the project board (data/project_board/)."""
-    norm = _ensure_under_root(path, BOARD_ROOT)
+    norm = _normalize_scoped_path(path, BOARD_PREFIXES, BOARD_PATH)
     return await _fs_call(pool, "fs_board", "read_file", {"path": norm})
 
 
 async def board_write_file(pool: MCPClientPool, path: str, content: str) -> str:
     """Create or update a ticket/document on the project board."""
-    norm = _ensure_under_root(path, BOARD_ROOT)
+    norm = _normalize_scoped_path(path, BOARD_PREFIXES, BOARD_PATH)
     return await _fs_call(pool, "fs_board", "write_file", {"path": norm, "content": content})
 
 
 async def board_create_directory(pool: MCPClientPool, path: str) -> str:
     """Create a directory on the project board."""
-    norm = _ensure_under_root(path, BOARD_ROOT)
+    norm = _normalize_scoped_path(path, BOARD_PREFIXES, BOARD_PATH)
     return await _fs_call(pool, "fs_board", "create_directory", {"path": norm})
 
 
 async def board_list_directory(pool: MCPClientPool, path: str = "") -> str:
     """List entries on the project board."""
-    norm = _ensure_under_root(path, BOARD_ROOT)
+    norm = _normalize_scoped_path(path, BOARD_PREFIXES, BOARD_PATH)
     return await _fs_call(pool, "fs_board", "list_directory", {"path": norm})
 
 
 async def board_get_file_info(pool: MCPClientPool, path: str) -> str:
     """Get metadata for a board path."""
-    norm = _ensure_under_root(path, BOARD_ROOT)
+    norm = _normalize_scoped_path(path, BOARD_PREFIXES, BOARD_PATH)
     return await _fs_call(pool, "fs_board", "get_file_info", {"path": norm})
 
 
 async def board_read_multiple_files(pool: MCPClientPool, paths: list[str]) -> str:
     """Read multiple board files at once."""
-    norm_paths = [_ensure_under_root(p, BOARD_ROOT) for p in paths]
+    norm_paths = [_normalize_scoped_path(p, BOARD_PREFIXES, BOARD_PATH) for p in paths]
     return await _fs_call(pool, "fs_board", "read_multiple_files", {"paths": norm_paths})
 
 
 async def docs_read_file(pool: MCPClientPool, path: str) -> str:
     """Read a knowledge-base document (data/knowledge_base/)."""
-    norm = _ensure_under_root(path, DOCS_ROOT)
+    norm = _normalize_scoped_path(path, DOCS_PREFIXES, DOCS_PATH)
     return await _fs_call(pool, "fs_docs", "read_file", {"path": norm})
 
 
 async def docs_write_file(pool: MCPClientPool, path: str, content: str) -> str:
     """Create or update a knowledge-base document."""
-    norm = _ensure_under_root(path, DOCS_ROOT)
+    norm = _normalize_scoped_path(path, DOCS_PREFIXES, DOCS_PATH)
     return await _fs_call(pool, "fs_docs", "write_file", {"path": norm, "content": content})
 
 
 async def docs_create_directory(pool: MCPClientPool, path: str) -> str:
     """Create a directory in the knowledge base."""
-    norm = _ensure_under_root(path, DOCS_ROOT)
+    norm = _normalize_scoped_path(path, DOCS_PREFIXES, DOCS_PATH)
     return await _fs_call(pool, "fs_docs", "create_directory", {"path": norm})
 
 
 async def docs_list_directory(pool: MCPClientPool, path: str = "") -> str:
     """List entries in the knowledge base."""
-    norm = _ensure_under_root(path, DOCS_ROOT)
+    norm = _normalize_scoped_path(path, DOCS_PREFIXES, DOCS_PATH)
     return await _fs_call(pool, "fs_docs", "list_directory", {"path": norm})
 
 
 async def docs_get_file_info(pool: MCPClientPool, path: str) -> str:
     """Get metadata for a knowledge-base path."""
-    norm = _ensure_under_root(path, DOCS_ROOT)
+    norm = _normalize_scoped_path(path, DOCS_PREFIXES, DOCS_PATH)
     return await _fs_call(pool, "fs_docs", "get_file_info", {"path": norm})
 
 
 async def docs_read_multiple_files(pool: MCPClientPool, paths: list[str]) -> str:
     """Read multiple knowledge-base files at once."""
-    norm_paths = [_ensure_under_root(p, DOCS_ROOT) for p in paths]
+    norm_paths = [_normalize_scoped_path(p, DOCS_PREFIXES, DOCS_PATH) for p in paths]
     return await _fs_call(pool, "fs_docs", "read_multiple_files", {"paths": norm_paths})
 
 
 async def code_read_file(pool: MCPClientPool, path: str) -> str:
-    norm = _ensure_under_root(path, CODE_ROOT)
+    norm = _normalize_scoped_path(path, CODE_PREFIXES, CODE_PATH)
     return await _fs_call(pool, "fs_code", "read_file", {"path": norm})
 
 
 async def code_list_directory(pool: MCPClientPool, path: str = "") -> str:
-    norm = _ensure_under_root(path, CODE_ROOT)
+    norm = _normalize_scoped_path(path, CODE_PREFIXES, CODE_PATH)
     return await _fs_call(pool, "fs_code", "list_directory", {"path": norm})
 
 
 async def code_get_file_info(pool: MCPClientPool, path: str) -> str:
-    norm = _ensure_under_root(path, CODE_ROOT)
+    norm = _normalize_scoped_path(path, CODE_PREFIXES, CODE_PATH)
     return await _fs_call(pool, "fs_code", "get_file_info", {"path": norm})
 
 
 async def code_read_multiple_files(pool: MCPClientPool, paths: list[str]) -> str:
-    norm_paths = [_ensure_under_root(p, CODE_ROOT) for p in paths]
+    norm_paths = [_normalize_scoped_path(p, CODE_PREFIXES, CODE_PATH) for p in paths]
     return await _fs_call(pool, "fs_code", "read_multiple_files", {"paths": norm_paths})
 
 
 async def code_write_file(pool: MCPClientPool, path: str, content: str) -> str:
-    norm = _ensure_under_root(path, CODE_ROOT)
+    norm = _normalize_scoped_path(path, CODE_PREFIXES, CODE_PATH)
     return await _fs_call(pool, "fs_code", "write_file", {"path": norm, "content": content})
 
 
 async def code_create_directory(pool: MCPClientPool, path: str) -> str:
-    norm = _ensure_under_root(path, CODE_ROOT)
+    norm = _normalize_scoped_path(path, CODE_PREFIXES, CODE_PATH)
     return await _fs_call(pool, "fs_code", "create_directory", {"path": norm})
 
 
 async def code_move_file(pool: MCPClientPool, source: str, destination: str) -> str:
-    norm_src = _ensure_under_root(source, CODE_ROOT)
-    norm_dst = _ensure_under_root(destination, CODE_ROOT)
+    norm_src = _normalize_scoped_path(source, CODE_PREFIXES, CODE_PATH)
+    norm_dst = _normalize_scoped_path(destination, CODE_PREFIXES, CODE_PATH)
     return await _fs_call(pool, "fs_code", "move_file", {"source": norm_src, "destination": norm_dst})
 
 
 async def code_search_files(pool: MCPClientPool, path: str, pattern: str) -> str:
-    norm = _ensure_under_root(path, CODE_ROOT)
+    norm = _normalize_scoped_path(path, CODE_PREFIXES, CODE_PATH)
     return await _fs_call(pool, "fs_code", "search_files", {"path": norm, "pattern": pattern})
+
+
+def _allowed_commands() -> set[str]:
+    raw = os.environ.get(
+        "MAS_ALLOWED_COMMANDS",
+        "python,python3,pytest,py.test,uv,pip,pip3,tox,git,ls,cat,sed,grep,rg",
+    )
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+async def workspace_run_command(pool: MCPClientPool, command: str, timeout_seconds: int = 300) -> str:
+    del pool
+    parts = shlex.split(command)
+    if not parts:
+        record_tool_event("workspace_run_command", False, error="empty_command")
+        return "ERROR: empty command"
+    if parts[0] not in _allowed_commands():
+        record_tool_event("workspace_run_command", False, error="not_allowlisted", command=parts[0])
+        return f"ERROR: command '{parts[0]}' is not allowlisted"
+    timeout_limit = min(timeout_seconds, int(os.environ.get("MAS_COMMAND_TIMEOUT", "300")))
+    completed = subprocess.run(
+        parts,
+        cwd=os.environ.get("MAS_WORKSPACE_PATH", CODE_PATH),
+        capture_output=True,
+        text=True,
+        timeout=timeout_limit,
+        check=False,
+    )
+    success = completed.returncode == 0
+    record_tool_event(
+        "workspace_run_command",
+        success,
+        command=command,
+        returncode=completed.returncode,
+    )
+    return (
+        f"returncode={completed.returncode}\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
 
 
 BOARD_TOOLS = [
@@ -192,19 +259,28 @@ CODE_WRITE_TOOLS = [
     code_move_file,
 ]
 
+SHELL_TOOLS = [
+    workspace_run_command,
+]
+
 
 # ---------------------------------------------------------------------------
 # Git tools (mcp-server-git)
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+REPO_ROOT = os.environ.get("WORKSPACE_GIT_ROOT", CODE_PATH)
 
 
 async def _git_call(pool: MCPClientPool, tool: str, args: dict[str, Any]) -> str:
     # mcp-server-git (recent versions) expects a repo_path argument for most tools.
     # Default to this repository root so agents don't need to thread it through.
     args.setdefault("repo_path", REPO_ROOT)
-    result = await pool.call_tool("git", tool, args)
+    try:
+        result = await pool.call_tool("git", tool, args)
+        record_tool_event(tool, True, server_key="git")
+    except Exception as exc:
+        record_tool_event(tool, False, server_key="git", error=str(exc))
+        raise
     if hasattr(result, "content"):
         blocks = result.content
         if blocks and hasattr(blocks[0], "text"):
@@ -319,8 +395,8 @@ __all__ = [
     "DOCS_TOOLS",
     "CODE_READ_TOOLS",
     "CODE_WRITE_TOOLS",
+    "SHELL_TOOLS",
     "GIT_READ_TOOLS",
     "GIT_WRITE_TOOLS",
     "bind_tools",
 ]
-
