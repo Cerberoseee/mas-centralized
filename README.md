@@ -26,7 +26,7 @@ Each agent is backed by an LLM and has access to a curated set of [MCP](https://
 |---|---|---|---|
 | **ProjectManager** | Alice | Breaks down ideas into tickets, drives the team, writes the final summary | `fs_board`, `fs_docs` |
 | **Architect** | Bob | Produces system design and architecture docs | `fs_board`, `fs_docs`, `fs_code` |
-| **Engineer** | Charlie | Implements code in the workspace, commits via git | `fs_board`, `fs_docs`, `fs_code`, `git` |
+| **Engineer** | Charlie | **Implemented by [`mini-swe-agent`](https://mini-swe-agent.com/)** — runs a fresh bash-driven coding loop inside the workspace | `fs_board`, `fs_docs`, `fs_code`, `git` (via `mcp_call`) |
 | **CodeReviewer** | Diana | Reviews code for quality, correctness, and conventions | `fs_docs`, `fs_code`, `git` |
 | **QA** | Eve | Tests the implementation and reports results | `fs_board`, `fs_code` |
 
@@ -52,7 +52,7 @@ mas-centralize/
 │   └── roles/
 │       ├── project_manager.py
 │       ├── architect.py
-│       ├── engineer.py
+│       ├── engineer.py      # mini-swe-agent backed (BaseChatAgent + MCPLocalEnvironment)
 │       ├── code_reviewer.py
 │       └── qa.py
 ├── core/
@@ -107,6 +107,16 @@ AUTOGEN_MODEL=gpt-4o
 
 # LLM temperature (default: 0.1)
 AUTOGEN_TEMPERATURE=0.1
+
+# Optional: cost ceiling per mini-swe-agent run, in USD (default: 3.0).
+# MINI_AGENT_COST_LIMIT=3.0
+
+# Optional: hard step ceiling per mini-swe-agent run (default: 0 = unlimited).
+# MINI_AGENT_STEP_LIMIT=0
+
+# Optional: timeout (seconds) for a single mcp_call from inside mini-swe-agent
+# (default: 120).
+# MINI_AGENT_MCP_TIMEOUT=120
 ```
 
 **3. Initialise the workspace git repo** (first run only, **required for git MCP tools**)
