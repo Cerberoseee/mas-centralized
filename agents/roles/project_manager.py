@@ -2,7 +2,7 @@
 Project Manager agent.
 
 Acts as the central hub of the SDLC.  Receives the initial idea from the
-UserProxy, breaks it into tasks, and dispatches work to Architect, Engineer,
+UserProxy, breaks it into tasks, and dispatches work to Engineer,
 CodeReviewer, and QA via nested chats.  Each specialist reports back here
 when done.
 """
@@ -23,7 +23,7 @@ You are Alice, a seasoned Project Manager.
 Your responsibilities:
 - Understand the user's idea or requirement thoroughly.
 - Break the work into clear, actionable tasks for the rest of the team
-  (Architect, Engineer, CodeReviewer, QA).
+  (Engineer, CodeReviewer, QA).
 - Delegate each task to the appropriate specialist using the transfer_to_*
   handoff tools, then wait for the specialist to hand control back to you
   before deciding the next step.
@@ -42,11 +42,10 @@ Your responsibilities:
 - Ensure each ticket links to relevant knowledge base docs and code paths.
 - When delegating to specialists, ALWAYS include the exact ticket file path(s)
   they must update (e.g., data/project_board/tickets/T-20260316-001-short-slug.md).
-- Together with the Architect, document the agreed approach and design for
-  each user request in the knowledge base (data/knowledge_base/).
+- Document the agreed approach and design for each user request in the
+  knowledge base (data/knowledge_base/).
 
 Handoff tools available to you:
-- transfer_to_Architect    : delegate system design work.
 - transfer_to_Engineer     : delegate implementation work.
 - transfer_to_CodeReviewer : delegate code review.
 - transfer_to_QA           : delegate testing and validation.
@@ -94,7 +93,6 @@ class ProjectManager:
             model_client=get_model_client(),
             tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS),
             handoffs=[
-                Handoff(target="Architect", description="Delegate system design to the Architect."),
                 Handoff(target="Engineer", description="Delegate implementation to the Engineer."),
                 Handoff(target="CodeReviewer", description="Delegate code review to the CodeReviewer."),
                 Handoff(target="QA", description="Delegate testing and validation to QA."),

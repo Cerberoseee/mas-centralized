@@ -5,7 +5,17 @@ Loads cost/step/env from mini-swe-agent's ``default.yaml``, but **replaces**
 agent/model templates: bundled yaml documents `` ```mswea_bash_command``` **
 markdown fences**, while ``LitellmModel`` only executes OpenAI-style ``bash``
 tool calls — without that alignment every turn fails with "No tool calls found".
-``mcp_call`` is handled locally; other commands use ``LocalEnvironment``.
+``mcp_call`` is intercepted locally; real bash commands are routed to either
+``LocalEnvironment`` (host) or ``DockerEnvironment`` (SWE-bench container).
+
+Docker mode (set ``MINI_AGENT_USE_DOCKER=1``)
+---------------------------------------------
+When enabled the Engineer starts a per-turn Docker container from the
+official SWE-bench per-instance image (derived from ``MAS_EVAL_TASK_ID``).
+Every bash command the LLM generates executes via ``docker exec … bash -lc``
+so the conda env inside the container is auto-activated — no host-side venv,
+no C compilation, no PEP 668.  ``mcp_call`` lines are still dispatched to the
+host-side ``MCPClientPool`` as before.
 
 Receives implementation tasks from the ProjectManager (guided by the
 Architect's design), writes or refactors code in the workspace, commits
@@ -20,8 +30,10 @@ import json
 import logging
 import os
 import shlex
+import subprocess
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -55,7 +67,9 @@ Path(os.environ["MSWEA_GLOBAL_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
 
 from minisweagent import package_dir  # noqa: E402
 from minisweagent.agents.default import DefaultAgent  # noqa: E402
+from minisweagent.environments.docker import DockerEnvironment  # noqa: E402
 from minisweagent.environments.local import LocalEnvironment  # noqa: E402
+from minisweagent.exceptions import LimitsExceeded  # noqa: E402
 from minisweagent.models.litellm_model import LitellmModel  # noqa: E402
 
 
@@ -74,12 +88,15 @@ def _load_default_config() -> dict[str, Any]:
 
 
 def _resolve_model_name() -> str:
-    """LiteLLM-compatible model name for the inner mini-swe-agent."""
-    return (
-        os.environ.get("MINI_AGENT_MODEL")
-        or os.environ.get("AUTOGEN_MODEL")
-        or "gpt-4o"
-    )
+    """LiteLLM-compatible model name for the inner mini-swe-agent.
+
+    Priority: explicit per-process ``MINI_AGENT_MODEL`` override, then the
+    centralized helper (``AUTOGEN_MODEL`` → ``MAS_EVAL_BASE_MODEL`` →
+    ``"gpt-4o"``), so the same study.toml ``base_model`` flows through.
+    """
+    from core.autogen_config import resolve_base_model_name
+
+    return os.environ.get("MINI_AGENT_MODEL") or resolve_base_model_name()
 
 
 def _resolve_cost_limit() -> float:
@@ -115,6 +132,62 @@ def _resolve_mcp_timeout() -> float:
         return 120.0
 
 
+def _resolve_guard_max_repeat() -> int:
+    """Trip the loop guard when the same command runs N times in a row.
+
+    Override with ``MINI_AGENT_GUARD_MAX_REPEAT`` (default: 4).
+    """
+    raw = os.environ.get("MINI_AGENT_GUARD_MAX_REPEAT")
+    if raw is None:
+        return 4
+    try:
+        val = int(raw)
+        if val < 2:
+            raise ValueError("must be >= 2")
+        return val
+    except ValueError:
+        logger.warning("Invalid MINI_AGENT_GUARD_MAX_REPEAT=%r, using 4", raw)
+        return 4
+
+
+def _resolve_guard_max_failures() -> int:
+    """Trip the loop guard after N consecutive non-zero exits with no success.
+
+    Override with ``MINI_AGENT_GUARD_MAX_FAILS`` (default: 12).
+    """
+    raw = os.environ.get("MINI_AGENT_GUARD_MAX_FAILS")
+    if raw is None:
+        return 12
+    try:
+        val = int(raw)
+        if val < 2:
+            raise ValueError("must be >= 2")
+        return val
+    except ValueError:
+        logger.warning("Invalid MINI_AGENT_GUARD_MAX_FAILS=%r, using 12", raw)
+        return 12
+
+
+def _resolve_max_engineer_turns() -> int:
+    """Maximum number of Engineer turns before a hard stop is issued.
+
+    Prevents destructive loops where the model repeatedly overwrites source
+    files with stubs or otherwise makes things worse across many re-invocations.
+    Override with ``MINI_AGENT_MAX_ENGINEER_TURNS`` (default: 5).
+    """
+    raw = os.environ.get("MINI_AGENT_MAX_ENGINEER_TURNS")
+    if raw is None:
+        return 5
+    try:
+        val = int(raw)
+        if val < 1:
+            raise ValueError("must be >= 1")
+        return val
+    except ValueError:
+        logger.warning("Invalid MINI_AGENT_MAX_ENGINEER_TURNS=%r, using 5", raw)
+        return 5
+
+
 def _resolve_mini_cmd_timeout(env_cfg: dict[str, Any]) -> None:
     """Optional override of per-step shell timeout from MINI_AGENT_CMD_TIMEOUT (seconds)."""
     raw = os.environ.get("MINI_AGENT_CMD_TIMEOUT", "").strip()
@@ -126,6 +199,82 @@ def _resolve_mini_cmd_timeout(env_cfg: dict[str, Any]) -> None:
         logger.warning("Invalid MINI_AGENT_CMD_TIMEOUT=%r, ignoring", raw)
 
 
+def _workspace_venv_bin(workspace: str) -> Path | None:
+    """Return ``.../bin`` (or ``.../Scripts``) if a local venv exists under the workspace."""
+    root = Path(workspace)
+    for name in ("venv", ".venv"):
+        for sub in ("bin", "Scripts"):
+            candidate = root / name / sub
+            is_dir = candidate.is_dir()
+            logger.info("[venv-detect] checking %s → is_dir=%s", candidate, is_dir)
+            if is_dir:
+                return candidate
+    logger.info("[venv-detect] no venv found under workspace=%s", workspace)
+    return None
+
+
+def _posix_bash_executable() -> str | None:
+    """Use bash for ``shell=True`` so agents can use ``source`` (``sh`` has no ``source``)."""
+    if os.name != "posix":
+        return None
+    candidate = Path("/bin/bash")
+    return str(candidate) if candidate.is_file() else None
+
+
+def _merge_mini_env_with_venv_on_path(workspace_root: str, base_env: dict[str, str]) -> dict[str, str]:
+    """Return a copy of ``base_env`` with workspace ``venv``/``.venv`` prepended to ``PATH`` when present."""
+    if os.environ.get("MAS_MINI_AGENT_SKIP_VENV_PATH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return dict(base_env)
+    venv_bin = _workspace_venv_bin(workspace_root)
+    if venv_bin is None:
+        return dict(base_env)
+    out = dict(base_env)
+    path = out.get("PATH", "")
+    vbin_s = os.fsdecode(venv_bin)
+    sep = os.pathsep
+    if path == vbin_s or path.startswith(vbin_s + sep):
+        out.setdefault("VIRTUAL_ENV", str(venv_bin.parent))
+        return out
+    out["PATH"] = f"{venv_bin}{sep}{path}"
+    out.setdefault("VIRTUAL_ENV", str(venv_bin.parent))
+    return out
+
+
+def _prepend_workspace_venv_to_path(env_cfg: dict[str, Any], workspace: str) -> None:
+    """Put workspace ``venv``/``.venv`` first on PATH so ``pip``/``pytest`` match the project interpreter.
+
+    Without this, models often invoke system ``pip`` (PEP 668) while errors in the log refer to
+    ``workspace/venv/...``, which wastes turns. Set ``MAS_MINI_AGENT_SKIP_VENV_PATH=1`` to disable.
+    """
+    if os.environ.get("MAS_MINI_AGENT_SKIP_VENV_PATH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    venv_bin = _workspace_venv_bin(workspace)
+    if venv_bin is None:
+        return
+    env = env_cfg.setdefault("env", {})
+    if not isinstance(env, dict):
+        return
+    # Copy so we do not mutate a shared reference from default.yaml.
+    env_cfg["env"] = dict(env)
+    env = env_cfg["env"]
+    base_path = env.get("PATH", os.environ.get("PATH", ""))
+    env["PATH"] = f"{venv_bin}{os.pathsep}{base_path}"
+    env.setdefault("VIRTUAL_ENV", str(venv_bin.parent))
+    logger.info(
+        "[Engineer/mini] prepended workspace venv to PATH: %s (VIRTUAL_ENV=%s)",
+        venv_bin,
+        env.get("VIRTUAL_ENV"),
+    )
+
+
 def _tool_choice_for_litellm() -> dict[str, str]:
     """Optional ``tool_choice`` for litellm; default forces one tool call per turn."""
     if "MINI_AGENT_TOOL_CHOICE" not in os.environ:
@@ -134,6 +283,35 @@ def _tool_choice_for_litellm() -> dict[str, str]:
     if raw.lower() in ("", "no", "none", "false", "0", "off", "unset"):
         return {}
     return {"tool_choice": raw}
+
+
+def _swebench_image_name(instance_id: str) -> str:
+    """Return the Docker Hub image name for a SWE-bench instance.
+
+    Docker doesn't allow ``__`` in image names; the SWE-bench project
+    substitutes them with ``_1776_`` (a magic token unlikely to clash).
+    """
+    docker_id = instance_id.replace("__", "_1776_")
+    tag = os.environ.get("MINI_AGENT_DOCKER_IMAGE_TAG", "latest")
+    return f"docker.io/swebench/sweb.eval.x86_64.{docker_id}:{tag}".lower()
+
+
+def _resolve_docker_image() -> str | None:
+    """Return the SWE-bench Docker image to use, or None for host execution.
+
+    Activated by setting ``MINI_AGENT_USE_DOCKER=1`` in the environment.
+    Requires ``MAS_EVAL_TASK_ID`` to be set (injected by the eval harness).
+    """
+    if os.environ.get("MINI_AGENT_USE_DOCKER", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    instance_id = os.environ.get("MAS_EVAL_TASK_ID", "").strip()
+    if not instance_id:
+        logger.warning(
+            "[Engineer/mini] MINI_AGENT_USE_DOCKER=1 but MAS_EVAL_TASK_ID is not set; "
+            "falling back to LocalEnvironment"
+        )
+        return None
+    return _swebench_image_name(instance_id)
 
 
 # LitellmModel parses OpenAI ``bash`` tool_calls only — not ```mswea_bash_command``` fences from default.yaml.
@@ -148,9 +326,11 @@ Pass a JSON object with a single key: `command` (the shell string). You may add 
 in normal assistant text, but the action that runs is always the `bash` tool call.
 
 Rules for `command`:
-- It runs with shell=True in the workspace directory given in the task message.
+- It runs with **bash** (POSIX), not plain `sh`, so `source venv/bin/activate` works when needed.
+- If the workspace has `venv/` or `.venv/`, that environment's `bin` is prepended to `PATH` for each command (after it exists), so `pip`/`pytest` match the project interpreter—avoid bare system `pip` on PEP 668 hosts.
 - Combine steps with `&&` or `||` on one line when needed.
 - MCP tools: start the command with `mcp_call <server> <tool> '<JSON>'` (see task message for servers).
+- **Never** run `git push` — there is no remote; commits stay local only.
 - To finish the task, your **last** `bash` call must be **only**: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
   (do not chain other commands on that final step).
 """
@@ -183,7 +363,7 @@ Execute work by calling the **`bash` tool** each turn (see system message). Opti
 2. Create a small script or command to reproduce the issue when practical.
 3. Edit the source code to resolve the issue.
 4. Verify the fix (run targeted tests or your repro).
-5. Commit when ready (`mcp_call git ...` or the platform `git` CLI in `bash`).
+5. Commit when ready (`mcp_call git ...` or the platform `git` CLI in `bash`). Do **not** push — there is no remote.
 6. Finish by calling `bash` with command exactly: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
    (that step alone; after that you cannot continue).
 
@@ -198,23 +378,64 @@ Execute work by calling the **`bash` tool** each turn (see system message). Opti
 
 ## Useful patterns (inside the `command` string)
 
-### Create / overwrite a file
+### What you do and do NOT edit
 
-Use heredoc or your platform's file redirection inside the `command` value.
+- You edit IMPLEMENTATION code only (e.g. `/testbed/<package>/<module>.py`).
+- You do NOT edit anything under `tests/` or matching `test_*.py`, and you do
+  NOT edit any `conftest.py`. The dataset's gold tests are pre-applied to the
+  container by the harness; the test IDs you need ALREADY EXIST. If a
+  Fail-to-pass ID is missing, escalate — do not write tests yourself.
 
-### Edit with sed
+### Editing IMPLEMENTATION `.py` files (canonical safe pattern)
+
+The repository lives **inside the Docker container at `/testbed`**. Host-side
+`fs_code` MCP cannot see container paths, so use this **read-modify-write
+Python heredoc** for any non-trivial change:
+
+    python - <<'PY'
+    import pathlib
+    p = pathlib.Path("/testbed/<package>/<module>.py")
+    src = p.read_text()
+    new = src.replace("OLD_BLOCK", "NEW_BLOCK")
+    assert new != src, "edit pattern did not match — abort"
+    p.write_text(new)
+    PY
+
+The assert fails BEFORE any `write_text` call if `OLD_BLOCK` does not match,
+so the file is preserved on a missed pattern.
+
+### Forbidden patterns (have repeatedly destroyed files)
+
+- `cat > /testbed/.../file.py <<EOF ...` — truncates the entire file first.
+- `echo "..." > /testbed/.../file.py`     — same.
+- `... >> /testbed/.../file.py`           — appends raw text outside any block.
+- `sed -i '1i\\...' /testbed/.../file.py` — prepends at line 1, scrambles
+  import order, cascading NameErrors.
+- `sed -i '$a...' /testbed/.../file.py`   — appends after the last line, same.
+
+### Read-only viewing (fine in bash)
+
+`nl -ba path/to/file.py | sed -n '10,30p'`, `head`, `tail`, `grep -n`.
+
+### `mcp_call fs_code` — only when NOT running the Docker arm
+
+When the workspace is on the host (no SWE-bench container), `fs_code` is
+rooted at `MAS_WORKSPACE_PATH` and you may use it:
+
+    mcp_call fs_code read_file '{"path":"<host-path>/file.py"}'
+    mcp_call fs_code write_file '{"path":"<host-path>/file.py","content":"..."}'
+
+In Docker mode `fs_code` cannot reach `/testbed`; use the bash heredoc above.
+
+### Last-resort tiny substitution (implementation files only)
+
+For a single-line, single-occurrence substring fix that you have verified
+with `grep -c`, you may use `sed -i 's/OLD/NEW/' /testbed/.../file.py` ONCE.
+Never use `sed` to insert or append blocks.
 
 {% if system == "Darwin" %}
-<important>
-You are on macOS: use `sed -i ''` for in-place edits.
-</important>
+On macOS, use `sed -i '' 's/OLD/NEW/g' ...` for in-place edits.
 {% endif %}
-
-Example: `sed -i 's/old/new/g' path/to/file.py` (on Linux/Git Bash). On macOS use `sed -i '' 's/old/new/g' ...`.
-
-### View part of a file
-
-Example: `nl -ba path/to/file.py | sed -n '10,30p'`
 """
 
 
@@ -233,57 +454,149 @@ def _apply_litellm_tool_templates(agent_cfg: dict[str, Any], model_cfg: dict[str
 # ---------------------------------------------------------------------------
 
 
-class MCPLocalEnvironment(LocalEnvironment):
-    """``LocalEnvironment`` that also handles ``mcp_call`` pseudo-commands.
+# ---------------------------------------------------------------------------
+# Loop guard
+# ---------------------------------------------------------------------------
 
-    Action grammar::
 
-        mcp_call <server_key> <tool_name> [JSON_ARGS]
+class _LoopGuard:
+    """Detects unproductive spirals inside a single mini-swe-agent run.
 
-    Examples::
+    Two heuristics, either of which trips the guard:
 
-        mcp_call fs_board list_directory '{}'
-        mcp_call fs_code write_file '{"path":"data/workspace/main.py","content":"..."}'
-        mcp_call git git_status '{}'
-        mcp_call git git_add '{"files":["main.py"]}'
-        mcp_call git git_commit '{"message":"feat: implement T-1"}'
+    1. **Repeated identical command** — the same exact bash/mcp_call command
+       string is issued ``max_repeated_command`` times in a row. This catches
+       the classic "re-run the same failing pytest" or "re-issue the same
+       broken sed" loop where the model never adapts.
+    2. **No-success streak** — ``max_consecutive_failures`` non-zero return
+       codes in a row without a single success. This catches multi-strategy
+       spirals where the command keeps changing but nothing ever works.
 
-    The MCP call is dispatched onto the parent asyncio loop via
-    ``run_coroutine_threadsafe`` because mini-swe-agent runs synchronously
-    in a worker thread (see ``_MiniEngineerAgent.on_messages``) while the
-    ``MCPClientPool`` lives on the main loop.
+    Either limit is configurable via env vars, see ``_resolve_guard_max_*``
+    in this module. When tripped, the host env's ``execute()`` raises a
+    ``LimitsExceeded`` so ``DefaultAgent.run()`` exits cleanly, surfacing
+    a "LoopGuard" exit_status to the wrapping ``_MiniEngineerAgent``.
     """
 
     def __init__(
         self,
         *,
-        pool: MCPClientPool,
-        parent_loop: asyncio.AbstractEventLoop,
-        allowed_servers: tuple[str, ...] | None = None,
-        mcp_timeout: float = 120.0,
-        **kwargs: Any,
+        max_repeated_command: int,
+        max_consecutive_failures: int,
+        owner_label: str = "engineer",
     ) -> None:
-        super().__init__(**kwargs)
-        self._pool = pool
-        self._parent_loop = parent_loop
-        self._allowed_servers = (
-            tuple(allowed_servers)
-            if allowed_servers is not None
-            else tuple(ROLE_SERVERS.get("engineer", []))
+        if max_repeated_command < 2:
+            raise ValueError("max_repeated_command must be >= 2")
+        if max_consecutive_failures < 2:
+            raise ValueError("max_consecutive_failures must be >= 2")
+        self._max_repeat = max_repeated_command
+        self._max_fails = max_consecutive_failures
+        self._owner = owner_label
+        self._recent: deque[str] = deque(maxlen=max_repeated_command)
+        self._consecutive_failures = 0
+        self._tripped_reason: str | None = None
+
+    @property
+    def tripped(self) -> bool:
+        return self._tripped_reason is not None
+
+    @property
+    def reason(self) -> str:
+        return self._tripped_reason or ""
+
+    def observe(self, command: str, returncode: int) -> None:
+        """Record a single executed command. Sets ``tripped`` when a limit fires."""
+        if self._tripped_reason is not None:
+            return
+
+        normalized = " ".join(command.split())
+        self._recent.append(normalized)
+
+        if (
+            len(self._recent) == self._max_repeat
+            and normalized
+            and len(set(self._recent)) == 1
+        ):
+            preview = normalized if len(normalized) <= 200 else normalized[:200] + "…"
+            self._tripped_reason = (
+                f"same command issued {self._max_repeat} times in a row "
+                f"with no adaptation: `{preview}`"
+            )
+            logger.warning("[%s] LoopGuard tripped (repeat): %s", self._owner, preview)
+            return
+
+        if returncode != 0:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._max_fails:
+                self._tripped_reason = (
+                    f"{self._max_fails} consecutive non-zero exit codes with no "
+                    "successful command — work appears stuck"
+                )
+                logger.warning(
+                    "[%s] LoopGuard tripped (no-success streak of %d)",
+                    self._owner,
+                    self._max_fails,
+                )
+        else:
+            self._consecutive_failures = 0
+
+    def raise_if_tripped(self) -> None:
+        """Raise ``LimitsExceeded`` with an exit message if the guard tripped.
+
+        ``DefaultAgent.run()`` catches ``InterruptAgentFlow`` (parent of
+        ``LimitsExceeded``) and breaks its loop when the appended message has
+        ``role == "exit"`` — so wrapping the abort in this exception is the
+        correct way to terminate the agent cleanly from inside the env.
+        """
+        if not self._tripped_reason:
+            return
+        content = (
+            f"LoopGuard: {self._tripped_reason}. "
+            "Aborting this engineer turn so the ProjectManager can re-route. "
+            "If a fix really requires more iterations, raise "
+            "MINI_AGENT_GUARD_MAX_REPEAT / MINI_AGENT_GUARD_MAX_FAILS or "
+            "switch to a stronger base_model."
         )
-        self._mcp_timeout = mcp_timeout
+        raise LimitsExceeded(
+            {
+                "role": "exit",
+                "content": content,
+                "extra": {
+                    "exit_status": "LoopGuard",
+                    # Surface the reason via `submission` so it bubbles up to the
+                    # PM's summary, since `_format_summary` keys off submission.
+                    "submission": content,
+                    "loop_guard_reason": self._tripped_reason,
+                },
+            }
+        )
 
-    # The base class signature in mini-swe-agent v2 is:
-    #   execute(self, action, cwd="", *, timeout=None) -> dict
-    def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
-        command = (action.get("command") or "").lstrip()
-        if command.startswith("mcp_call"):
-            return self._handle_mcp_call(command)
-        return super().execute(action, cwd, timeout=timeout)
 
-    # ------------------------------------------------------------------
-    # mcp_call dispatch
-    # ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Shared MCP dispatch mixin
+# ---------------------------------------------------------------------------
+
+
+class _MCPDispatchMixin:
+    """Mixin that intercepts ``mcp_call`` commands and routes them to the
+    host-side ``MCPClientPool``.
+
+    Concrete subclasses must set the following attributes in their
+    ``__init__`` before calling any ``execute``:
+
+    * ``_pool`` — ``MCPClientPool``
+    * ``_parent_loop`` — ``asyncio.AbstractEventLoop``
+    * ``_allowed_servers`` — ``tuple[str, ...]``
+    * ``_mcp_timeout`` — ``float``
+
+    Action grammar for mcp_call::
+
+        mcp_call <server_key> <tool_name> [JSON_ARGS]
+
+    The MCP call is dispatched onto the parent asyncio loop via
+    ``run_coroutine_threadsafe`` because mini-swe-agent runs synchronously
+    in a worker thread while the ``MCPClientPool`` lives on the main loop.
+    """
 
     def _handle_mcp_call(self, command: str) -> dict[str, Any]:
         try:
@@ -364,6 +677,161 @@ class MCPLocalEnvironment(LocalEnvironment):
 
 
 # ---------------------------------------------------------------------------
+# Environment implementations
+# ---------------------------------------------------------------------------
+
+
+class MCPLocalEnvironment(_MCPDispatchMixin, LocalEnvironment):
+    """``LocalEnvironment`` that intercepts ``mcp_call`` pseudo-commands.
+
+    Real bash commands run on the host via ``subprocess``; ``mcp_call``
+    lines are dispatched to the host-side ``MCPClientPool``.
+    """
+
+    def __init__(
+        self,
+        *,
+        pool: MCPClientPool,
+        parent_loop: asyncio.AbstractEventLoop,
+        allowed_servers: tuple[str, ...] | None = None,
+        mcp_timeout: float = 120.0,
+        **kwargs: Any,
+    ) -> None:
+        LocalEnvironment.__init__(self, **kwargs)
+        self._pool = pool
+        self._parent_loop = parent_loop
+        self._allowed_servers = (
+            tuple(allowed_servers)
+            if allowed_servers is not None
+            else tuple(ROLE_SERVERS.get("engineer", []))
+        )
+        self._mcp_timeout = mcp_timeout
+        self._loop_guard = _LoopGuard(
+            max_repeated_command=_resolve_guard_max_repeat(),
+            max_consecutive_failures=_resolve_guard_max_failures(),
+            owner_label="Engineer/local",
+        )
+
+    # The base class signature in mini-swe-agent v2 is:
+    #   execute(self, action, cwd="", *, timeout=None) -> dict
+    def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
+        # Surface a previously-tripped guard before doing anything else, so a
+        # late-arriving step from the model can't sneak past the abort.
+        self._loop_guard.raise_if_tripped()
+
+        command = (action.get("command") or "").lstrip()
+        if command.startswith("mcp_call"):
+            result = self._handle_mcp_call(command)
+        else:
+            result = self._execute_shell_like_local_env(action, cwd, timeout=timeout)
+
+        self._loop_guard.observe(command, int(result.get("returncode", -1)))
+        self._loop_guard.raise_if_tripped()
+        return result
+
+    def _execute_shell_like_local_env(
+        self, action: dict, cwd: str = "", *, timeout: int | None = None
+    ) -> dict[str, Any]:
+        """Mirror ``LocalEnvironment.execute`` but (1) merge venv PATH every call and (2) use bash on POSIX.
+
+        Startup-time PATH injection misses ``venv/`` created mid-run; checking the filesystem each
+        turn fixes PEP 668 loops from system ``pip``. Using ``/bin/bash`` fixes ``source: not found``.
+        """
+        shell_cmd = action.get("command", "")
+        cwd_resolved = cwd or self.config.cwd or os.getcwd()
+        merged = {**os.environ, **self.config.env}
+        env = _merge_mini_env_with_venv_on_path(cwd_resolved, merged)
+        run_kw: dict[str, Any] = {
+            "shell": True,
+            "text": True,
+            "cwd": cwd_resolved,
+            "env": env,
+            "timeout": timeout or self.config.timeout,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+        }
+        bash_exe = _posix_bash_executable()
+        if bash_exe:
+            run_kw["executable"] = bash_exe
+        try:
+            result = subprocess.run(shell_cmd, **run_kw)
+            output: dict[str, Any] = {
+                "output": result.stdout,
+                "returncode": result.returncode,
+                "exception_info": "",
+            }
+        except Exception as exc:  # noqa: BLE001 — match LocalEnvironment
+            raw_output = getattr(exc, "output", None)
+            raw_output = (
+                raw_output.decode("utf-8", errors="replace")
+                if isinstance(raw_output, bytes)
+                else (raw_output or "")
+            )
+            output = {
+                "output": raw_output,
+                "returncode": -1,
+                "exception_info": f"An error occurred while executing the command: {exc}",
+                "extra": {"exception_type": type(exc).__name__, "exception": str(exc)},
+            }
+        self._check_finished(output)
+        return output
+
+
+class MCPDockerEnvironment(_MCPDispatchMixin, DockerEnvironment):
+    """``DockerEnvironment`` that intercepts ``mcp_call`` pseudo-commands.
+
+    Real bash commands execute via ``docker exec … bash -lc`` inside the
+    SWE-bench per-instance container.  The login shell (``-l``) auto-activates
+    the conda ``testbed`` environment so ``pytest``/``pip``/``python`` all
+    resolve to the correct pre-compiled interpreter — no host-side venv or C
+    compilation required.
+
+    ``mcp_call`` lines are dispatched to the host-side ``MCPClientPool``
+    without touching the container, preserving git-MCP, fs-MCP, etc.
+    """
+
+    def __init__(
+        self,
+        *,
+        pool: MCPClientPool,
+        parent_loop: asyncio.AbstractEventLoop,
+        allowed_servers: tuple[str, ...] | None = None,
+        mcp_timeout: float = 120.0,
+        **kwargs: Any,
+    ) -> None:
+        DockerEnvironment.__init__(self, **kwargs)  # pulls image + starts container
+        self._pool = pool
+        self._parent_loop = parent_loop
+        self._allowed_servers = (
+            tuple(allowed_servers)
+            if allowed_servers is not None
+            else tuple(ROLE_SERVERS.get("engineer", []))
+        )
+        self._mcp_timeout = mcp_timeout
+        self._loop_guard = _LoopGuard(
+            max_repeated_command=_resolve_guard_max_repeat(),
+            max_consecutive_failures=_resolve_guard_max_failures(),
+            owner_label="Engineer/docker",
+        )
+
+    def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
+        self._loop_guard.raise_if_tripped()
+
+        command = (action.get("command") or "").lstrip()
+        if command.startswith("mcp_call"):
+            result = self._handle_mcp_call(command)
+        else:
+            # Route to DockerEnvironment.execute → docker exec … bash -lc
+            result = DockerEnvironment.execute(self, action, cwd, timeout=timeout)
+
+        self._loop_guard.observe(command, int(result.get("returncode", -1)))
+        self._loop_guard.raise_if_tripped()
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
@@ -393,9 +861,17 @@ def _build_engineer_briefing() -> str:
 
 
 def _build_paths_block() -> str:
+    # In Docker mode the Engineer's bash commands run inside the SWE-bench
+    # container where the repo lives at /testbed, not at the host CODE_PATH.
+    # Showing the host path here confuses the agent into navigating somewhere
+    # that doesn't exist inside the container.
+    if os.environ.get("MINI_AGENT_USE_DOCKER", "").strip().lower() in ("1", "true", "yes"):
+        workspace_path = "/testbed"
+    else:
+        workspace_path = CODE_PATH
     return (
         "## Workspace layout\n"
-        f"- Workspace (cwd):   {CODE_PATH}\n"
+        f"- Workspace (cwd):   {workspace_path}\n"
         f"- Project board:     {BOARD_PATH}\n"
         f"- Knowledge base:    {DOCS_PATH}\n"
     )
@@ -490,6 +966,30 @@ class _MiniEngineerAgent(BaseChatAgent):
     ) -> Response:
         del cancellation_token  # mini-swe-agent runs to completion or limit
         turn = next(self._turn_counter)
+
+        max_turns = _resolve_max_engineer_turns()
+        if turn > max_turns:
+            logger.warning(
+                "[Engineer] Hard stop: turn %d exceeds max_engineer_turns=%d. "
+                "Escalating to ProjectManager to prevent destructive loops.",
+                turn,
+                max_turns,
+            )
+            content = (
+                f"ESCALATE_TO_PROJECT_MANAGER: Engineer hard-stop triggered on turn {turn} "
+                f"(limit: {max_turns}). "
+                "The agent has been re-invoked too many times without resolving the task — "
+                "continuing risks further destructive changes (e.g. overwriting source files with stubs). "
+                "Please mark the task as failed or declare the best available state as the final submission."
+            )
+            return Response(
+                chat_message=HandoffMessage(
+                    source=self.name,
+                    target=self._handoff_target,
+                    content=content,
+                )
+            )
+
         task_prompt = _build_task_prompt(messages)
         traj_path = self._trajectory_path(turn)
 
@@ -530,6 +1030,66 @@ class _MiniEngineerAgent(BaseChatAgent):
     # mini-swe-agent driver
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_patch_from_docker(env: MCPDockerEnvironment, *, initial_head: str | None = None) -> None:
+        """Write patch.diff by running ``git diff`` inside the live container.
+
+        Called right after ``DefaultAgent.run()`` completes, while the
+        container is still alive (it sleeps for 2 h by default).
+
+        ``initial_head`` is the git SHA recorded *before* the agent ran.
+        Diffing against it (rather than ``base_commit``) is essential because
+        SWE-bench Docker images sometimes contain commits on top of
+        ``base_commit`` that were added during image construction (e.g.
+        environment pin-downs).  Using ``initial_head`` isolates only the
+        changes the agent actually made in this session.
+        """
+        patch_path_str = os.environ.get("MAS_EVAL_PATCH_PATH")
+        if not patch_path_str:
+            return
+        container_id = getattr(env, "container_id", None)
+        if not container_id:
+            logger.warning("[Engineer/mini] No container_id on MCPDockerEnvironment; cannot extract patch.")
+            return
+
+        if initial_head:
+            diff_ref = initial_head
+        else:
+            # Fallback: try base_commit from task context, then bare git diff.
+            diff_ref = None
+            ctx_path = os.environ.get("MAS_EVAL_TASK_CONTEXT_PATH")
+            if ctx_path:
+                try:
+                    ctx = json.loads(Path(ctx_path).read_text(encoding="utf-8"))
+                    diff_ref = ctx.get("base_commit")
+                except Exception:  # noqa: BLE001
+                    pass
+
+        diff_cmd = f"git diff {diff_ref}" if diff_ref else "git diff"
+        result = subprocess.run(
+            ["docker", "exec", container_id, "bash", "-lc", diff_cmd],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode == 0:
+            patch_path = Path(patch_path_str)
+            patch_path.parent.mkdir(parents=True, exist_ok=True)
+            patch_path.write_text(result.stdout, encoding="utf-8")
+            logger.info(
+                "[Engineer/mini] Patch extracted from container %s → %s (%d bytes)",
+                container_id[:12],
+                patch_path,
+                len(result.stdout),
+            )
+        else:
+            logger.warning(
+                "[Engineer/mini] git diff inside container failed (rc=%d): %s",
+                result.returncode,
+                result.stderr[:300],
+            )
+
     def _run_mini_agent(
         self,
         task_prompt: str,
@@ -546,28 +1106,106 @@ class _MiniEngineerAgent(BaseChatAgent):
         agent_cfg["output_path"] = traj_path
         _apply_litellm_tool_templates(agent_cfg, model_cfg)
 
-        workspace = os.environ.get("MAS_WORKSPACE_PATH", CODE_PATH)
-        env_cfg.setdefault("env", {})
-        env_cfg["cwd"] = workspace
         _resolve_mini_cmd_timeout(env_cfg)
-
+        env_cfg.setdefault("env", {})
         model_name = _resolve_model_name()
-        logger.info(
-            "[Engineer/mini] starting model=%s cwd=%s cost_limit=%s step_limit=%s",
-            model_name,
-            workspace,
-            agent_cfg["cost_limit"],
-            agent_cfg["step_limit"],
-        )
+        mcp_timeout = _resolve_mcp_timeout()
 
-        env = MCPLocalEnvironment(
-            pool=self._pool,
-            parent_loop=parent_loop,
-            mcp_timeout=_resolve_mcp_timeout(),
-            **env_cfg,
-        )
+        docker_image = _resolve_docker_image()
+        if docker_image:
+            logger.info(
+                "[Engineer/mini] Docker mode: image=%s cost_limit=%s step_limit=%s",
+                docker_image,
+                agent_cfg["cost_limit"],
+                agent_cfg["step_limit"],
+            )
+            # Only pass DockerEnvironmentConfig-compatible keys; venv PATH
+            # injection is unnecessary — bash -lc activates conda automatically.
+            docker_kwargs: dict[str, Any] = {
+                "image": docker_image,
+                "cwd": "/testbed",
+                "env": env_cfg.get("env", {}),
+            }
+            if "timeout" in env_cfg:
+                docker_kwargs["timeout"] = env_cfg["timeout"]
+
+            # Mount run_dir so the gold test_patch (and the engineer's own
+            # patch.diff later, if ever needed inside the container) are
+            # readable at /run_dir. Read-only is sufficient for git apply.
+            host_run_dir = os.environ.get("MAS_EVAL_RUN_DIR", "").strip()
+            if host_run_dir and os.path.isdir(host_run_dir):
+                docker_kwargs["run_args"] = ["--rm", "-v", f"{host_run_dir}:/run_dir:ro"]
+
+            env: MCPLocalEnvironment | MCPDockerEnvironment = MCPDockerEnvironment(
+                pool=self._pool,
+                parent_loop=parent_loop,
+                mcp_timeout=mcp_timeout,
+                **docker_kwargs,
+            )
+        else:
+            workspace = os.environ.get("MAS_WORKSPACE_PATH", CODE_PATH)
+            env_cfg["cwd"] = workspace
+            _prepend_workspace_venv_to_path(env_cfg, workspace)
+            logger.info(
+                "[Engineer/mini] Host mode: model=%s cwd=%s cost_limit=%s step_limit=%s",
+                model_name,
+                workspace,
+                agent_cfg["cost_limit"],
+                agent_cfg["step_limit"],
+            )
+            env = MCPLocalEnvironment(
+                pool=self._pool,
+                parent_loop=parent_loop,
+                mcp_timeout=mcp_timeout,
+                **env_cfg,
+            )
         model = LitellmModel(model_name=model_name, **model_cfg)
         inner = DefaultAgent(model, env, **agent_cfg)
+
+        # Apply the gold test_patch INSIDE the container before the agent runs,
+        # then commit it so `initial_head` advances past it. Mirrors the
+        # official SWE-bench harness: the dataset's test cases exist from the
+        # start, so the engineer only needs to fix the implementation.
+        # Recording `initial_head` AFTER the commit guarantees the engineer's
+        # later `git diff initial_head` never leaks the test_patch hunks.
+        initial_head: str | None = None
+        if isinstance(env, MCPDockerEnvironment):
+            test_patch_path = os.environ.get("MAS_EVAL_TEST_PATCH_PATH", "").strip()
+            if test_patch_path:
+                apply_cmd = (
+                    "if [ -f /run_dir/test_patch.diff ]; then "
+                    "git -c user.email=mas@local -c user.name=mas "
+                    "apply --whitespace=nowarn /run_dir/test_patch.diff "
+                    "&& git -c user.email=mas@local -c user.name=mas add -A "
+                    "&& git -c user.email=mas@local -c user.name=mas "
+                    "commit -m 'mas: gold test_patch (auto-applied)' --no-verify; "
+                    "fi"
+                )
+                apply_result = subprocess.run(
+                    ["docker", "exec", env.container_id, "bash", "-lc", apply_cmd],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                if apply_result.returncode == 0:
+                    logger.info(
+                        "[Engineer/mini] Applied + committed gold test_patch in container %s",
+                        env.container_id[:12],
+                    )
+                else:
+                    logger.warning(
+                        "[Engineer/mini] git apply/commit test_patch failed (rc=%d): %s",
+                        apply_result.returncode,
+                        (apply_result.stderr or apply_result.stdout)[:300],
+                    )
+
+            head_result = subprocess.run(
+                ["docker", "exec", env.container_id, "git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if head_result.returncode == 0:
+                initial_head = head_result.stdout.strip()
+                logger.info("[Engineer/mini] Container initial HEAD: %s", initial_head)
+            else:
+                logger.warning("[Engineer/mini] Could not read container HEAD: %s", head_result.stderr[:200])
 
         try:
             extra = inner.run(task_prompt) or {}
@@ -581,6 +1219,10 @@ class _MiniEngineerAgent(BaseChatAgent):
                 "n_calls": getattr(inner, "n_calls", 0),
                 "cost": getattr(inner, "cost", 0.0),
             }
+
+        # Extract patch before the container is cleaned up.
+        if isinstance(env, MCPDockerEnvironment):
+            self._extract_patch_from_docker(env, initial_head=initial_head)
 
         return {
             "exit_status": extra.get("exit_status", ""),
@@ -609,8 +1251,14 @@ class _MiniEngineerAgent(BaseChatAgent):
         if len(submission) > 4000:
             submission = submission[:4000] + "\n... [truncated; see trajectory]"
 
-        success = result.get("exit_status") == "Submitted"
-        status = "succeeded" if success else "did not submit cleanly"
+        exit_status = result.get("exit_status", "")
+        success = exit_status == "Submitted"
+        if exit_status == "LoopGuard":
+            status = "ABORTED by loop guard"
+        elif success:
+            status = "succeeded"
+        else:
+            status = "did not submit cleanly"
 
         lines = [
             f"Engineer (mini-swe-agent) {status} on turn {turn}.",

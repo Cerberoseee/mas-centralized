@@ -3,8 +3,7 @@ SDLC entry point.
 
 Orchestrates the AutoGen hub-and-spoke multi-agent workflow:
 
-    UserProxy  →  ProjectManager  ↔  Architect
-                                  ↔  Engineer
+    UserProxy  →  ProjectManager  ↔  Engineer
                                   ↔  CodeReviewer
                                   ↔  QA
 
@@ -38,7 +37,7 @@ from autogen_agentchat.agents import UserProxyAgent
 from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination
 from autogen_agentchat.teams import Swarm
 
-from agents import ProjectManager, Architect, Engineer, CodeReviewer, QA
+from agents import ProjectManager, Engineer, CodeReviewer, QA
 from agents.config import ensure_workspace_dirs
 from core.mcp_client import MCPClientPool
 from core.mcp_config import ROLE_SERVERS
@@ -101,12 +100,17 @@ async def start_sdlc(idea: str, rounds: int = 20) -> str:
         {key for keys in ROLE_SERVERS.values() for key in keys}
     )
 
+    # In Docker mode the workspace is the container's /testbed, not a local git
+    # repo.  The git MCP server (mcp-server-git) would crash trying to open an
+    # empty directory.  Git operations are handled inside the container via bash.
+    if os.environ.get("MINI_AGENT_USE_DOCKER"):
+        all_server_keys = [k for k in all_server_keys if k != "git"]
+
     logger.info("Opening MCP connections: %s", all_server_keys)
 
     async with MCPClientPool(server_keys=all_server_keys) as pool:
         # --- Instantiate role agents ---
         pm = ProjectManager(pool)
-        arch = Architect(pool)
         eng = Engineer(pool)
         reviewer = CodeReviewer(pool)
         qa = QA(pool)
@@ -125,7 +129,6 @@ async def start_sdlc(idea: str, rounds: int = 20) -> str:
         team = Swarm(
             participants=[
                 pm.agent,
-                arch.agent,
                 eng.agent,
                 reviewer.agent,
                 qa.agent,
@@ -172,9 +175,14 @@ def _write_patch_if_configured(base_commit: str | None = None) -> str | None:
     workspace = os.environ.get("MAS_WORKSPACE_PATH")
     if not patch_path or not workspace:
         return None
+    # In Docker mode the Engineer already wrote the patch from inside the
+    # container.  Skip the host-side git diff so we don't overwrite it with an
+    # empty diff from the non-git workspace directory.
+    if os.environ.get("MINI_AGENT_USE_DOCKER"):
+        return patch_path if Path(patch_path).exists() else None
     diff_cmd = ["git", "diff"]
     if base_commit:
-        diff_cmd = ["git", "diff", f"{base_commit}..HEAD"]
+        diff_cmd = ["git", "diff", base_commit]
     diff = subprocess.run(
         diff_cmd,
         cwd=workspace,

@@ -13,6 +13,7 @@ import inspect
 import os
 import shlex
 import subprocess
+from pathlib import Path
 from typing import Any, Callable
 
 from core.mcp_client import MCPClientPool
@@ -186,12 +187,111 @@ async def code_search_files(pool: MCPClientPool, path: str, pattern: str) -> str
     return await _fs_call(pool, "fs_code", "search_files", {"path": norm, "pattern": pattern})
 
 
+_PYTEST_RC4_NOTE = (
+    "NOTE: returncode=4 is pytest's exit code for 'no tests collected'. "
+    "The specified test ID does not exist in the current test file. "
+    "This is a hard verification failure — the test case is missing, not skipped."
+)
+
+
+def _format_command_output(returncode: int, stdout: str, stderr: str) -> str:
+    """Format the output of a workspace command, adding explanatory notes where helpful."""
+    base = f"returncode={returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    if returncode == 4:
+        base += f"\n\n{_PYTEST_RC4_NOTE}"
+    return base
+
+
 def _allowed_commands() -> set[str]:
     raw = os.environ.get(
         "MAS_ALLOWED_COMMANDS",
         "python,python3,pytest,py.test,uv,pip,pip3,tox,git,ls,cat,sed,grep,rg",
     )
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _docker_image_for_task() -> str | None:
+    """Return the SWE-bench Docker image name for the current task, or None.
+
+    Only non-None when ``MINI_AGENT_USE_DOCKER=1`` and ``MAS_EVAL_TASK_ID`` is set.
+    """
+    if os.environ.get("MINI_AGENT_USE_DOCKER", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    instance_id = os.environ.get("MAS_EVAL_TASK_ID", "").strip()
+    if not instance_id:
+        return None
+    docker_id = instance_id.replace("__", "_1776_")
+    tag = os.environ.get("MINI_AGENT_DOCKER_IMAGE_TAG", "latest")
+    return f"docker.io/swebench/sweb.eval.x86_64.{docker_id}:{tag}".lower()
+
+
+def _run_workspace_command_in_docker(
+    command: str,
+    parts: list[str],
+    image: str,
+    timeout: int,
+) -> str:
+    """Run a QA command inside a fresh SWE-bench Docker container.
+
+    When ``use_docker=true`` the host workspace_dir is an empty marker — the
+    repo lives only inside the container at ``/testbed``.  This helper spins up
+    a one-shot container from the same per-instance image, applies (in order):
+
+    1. The dataset's gold ``test_patch.diff`` (so fail_to_pass / pass_to_pass
+       test IDs actually exist — mirrors the official SWE-bench harness).
+    2. The engineer's ``patch.diff`` (the candidate fix, if produced yet).
+
+    Then runs the requested QA command so it sees the fixed implementation
+    against the gold test cases.
+    """
+    run_dir = os.environ.get("MAS_EVAL_RUN_DIR", "").strip()
+    patch_path = os.environ.get("MAS_EVAL_PATCH_PATH", "").strip()
+    test_patch_path = os.environ.get("MAS_EVAL_TEST_PATCH_PATH", "").strip()
+
+    patch_available = bool(run_dir and patch_path and os.path.isfile(patch_path))
+    test_patch_available = bool(
+        run_dir and test_patch_path and os.path.isfile(test_patch_path)
+    )
+    mount_run_dir = patch_available or test_patch_available
+
+    script_parts: list[str] = []
+    if test_patch_available:
+        # Gold tests first so engineer-side hunks layered on top still resolve.
+        script_parts.append(
+            "git apply --whitespace=nowarn /run_dir/test_patch.diff 2>/dev/null || true"
+        )
+    if patch_available:
+        script_parts.append(
+            "git apply --whitespace=nowarn /run_dir/patch.diff 2>/dev/null || true"
+        )
+    script_parts.append(shlex.join(parts))
+    script = " && ".join(script_parts)
+
+    docker_cmd = ["docker", "run", "--rm", "--workdir", "/testbed"]
+    if mount_run_dir:
+        docker_cmd += ["-v", f"{run_dir}:/run_dir:ro"]
+    docker_cmd += [image, "bash", "-lc", script]
+
+    try:
+        completed = subprocess.run(
+            docker_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        record_tool_event("workspace_run_command", False, command=command, error="timeout")
+        return f"ERROR: command timed out after {timeout}s inside Docker"
+
+    success = completed.returncode == 0
+    record_tool_event(
+        "workspace_run_command",
+        success,
+        command=command,
+        returncode=completed.returncode,
+    )
+    return _format_command_output(completed.returncode, completed.stdout, completed.stderr)
 
 
 async def workspace_run_command(pool: MCPClientPool, command: str, timeout_seconds: int = 300) -> str:
@@ -204,6 +304,13 @@ async def workspace_run_command(pool: MCPClientPool, command: str, timeout_secon
         record_tool_event("workspace_run_command", False, error="not_allowlisted", command=parts[0])
         return f"ERROR: command '{parts[0]}' is not allowlisted"
     timeout_limit = min(timeout_seconds, int(os.environ.get("MAS_COMMAND_TIMEOUT", "300")))
+
+    docker_image = _docker_image_for_task()
+    if docker_image:
+        # In Docker mode the host workspace is an empty directory; run the
+        # command inside a fresh container of the same SWE-bench image instead.
+        return _run_workspace_command_in_docker(command, parts, docker_image, timeout_limit)
+
     completed = subprocess.run(
         parts,
         cwd=os.environ.get("MAS_WORKSPACE_PATH", CODE_PATH),
@@ -219,11 +326,29 @@ async def workspace_run_command(pool: MCPClientPool, command: str, timeout_secon
         command=command,
         returncode=completed.returncode,
     )
-    return (
-        f"returncode={completed.returncode}\n"
-        f"stdout:\n{completed.stdout}\n"
-        f"stderr:\n{completed.stderr}"
-    )
+    return _format_command_output(completed.returncode, completed.stdout, completed.stderr)
+
+
+async def read_patch_diff(pool: MCPClientPool) -> str:
+    """Read the engineer's patch.diff for this SWE-bench task.
+
+    Returns the unified diff of all changes committed by the Engineer.
+    Use this in Docker mode instead of git_diff — the git MCP server is not
+    available when the repo lives inside a container rather than on the host.
+    """
+    del pool
+    patch_path = os.environ.get("MAS_EVAL_PATCH_PATH", "").strip()
+    if not patch_path:
+        return "ERROR: MAS_EVAL_PATCH_PATH is not set; patch.diff is not available."
+    try:
+        content = Path(patch_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"No patch.diff found at {patch_path} — the Engineer may not have committed yet."
+    except OSError as exc:
+        return f"ERROR reading {patch_path}: {exc}"
+    if not content.strip():
+        return "(patch.diff exists but is empty — no changes were committed by the Engineer)"
+    return content
 
 
 BOARD_TOOLS = [
@@ -261,6 +386,10 @@ CODE_WRITE_TOOLS = [
 
 SHELL_TOOLS = [
     workspace_run_command,
+]
+
+PATCH_TOOLS = [
+    read_patch_diff,
 ]
 
 
@@ -396,6 +525,7 @@ __all__ = [
     "CODE_READ_TOOLS",
     "CODE_WRITE_TOOLS",
     "SHELL_TOOLS",
+    "PATCH_TOOLS",
     "GIT_READ_TOOLS",
     "GIT_WRITE_TOOLS",
     "bind_tools",
