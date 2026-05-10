@@ -173,19 +173,19 @@ def _resolve_max_engineer_turns() -> int:
 
     Prevents destructive loops where the model repeatedly overwrites source
     files with stubs or otherwise makes things worse across many re-invocations.
-    Override with ``MINI_AGENT_MAX_ENGINEER_TURNS`` (default: 5).
+    Override with ``MINI_AGENT_MAX_ENGINEER_TURNS`` (default: 3).
     """
     raw = os.environ.get("MINI_AGENT_MAX_ENGINEER_TURNS")
     if raw is None:
-        return 5
+        return 3
     try:
         val = int(raw)
         if val < 1:
             raise ValueError("must be >= 1")
         return val
     except ValueError:
-        logger.warning("Invalid MINI_AGENT_MAX_ENGINEER_TURNS=%r, using 5", raw)
-        return 5
+        logger.warning("Invalid MINI_AGENT_MAX_ENGINEER_TURNS=%r, using 3", raw)
+        return 3
 
 
 def _resolve_mini_cmd_timeout(env_cfg: dict[str, Any]) -> None:
