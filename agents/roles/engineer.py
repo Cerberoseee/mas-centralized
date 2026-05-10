@@ -1,9 +1,16 @@
 """
 Engineer agent — backed by mini-swe-agent.
 
+Loads cost/step/env from mini-swe-agent's ``default.yaml``, but **replaces**
+agent/model templates: bundled yaml documents `` ```mswea_bash_command``` **
+markdown fences**, while ``LitellmModel`` only executes OpenAI-style ``bash``
+tool calls — without that alignment every turn fails with "No tool calls found".
+``mcp_call`` is handled locally; other commands use ``LocalEnvironment``.
+
 Receives implementation tasks from the ProjectManager (guided by the
 Architect's design), writes or refactors code in the workspace, commits
-via git, and reports back.
+via git, and reports back. SWE-bench runs emit ``patch.diff`` from
+``main._write_patch_if_configured`` after the workflow.
 """
 from __future__ import annotations
 
@@ -106,6 +113,119 @@ def _resolve_mcp_timeout() -> float:
     except ValueError:
         logger.warning("Invalid MINI_AGENT_MCP_TIMEOUT=%r, using 120", raw)
         return 120.0
+
+
+def _resolve_mini_cmd_timeout(env_cfg: dict[str, Any]) -> None:
+    """Optional override of per-step shell timeout from MINI_AGENT_CMD_TIMEOUT (seconds)."""
+    raw = os.environ.get("MINI_AGENT_CMD_TIMEOUT", "").strip()
+    if not raw:
+        return
+    try:
+        env_cfg["timeout"] = int(raw)
+    except ValueError:
+        logger.warning("Invalid MINI_AGENT_CMD_TIMEOUT=%r, ignoring", raw)
+
+
+def _tool_choice_for_litellm() -> dict[str, str]:
+    """Optional ``tool_choice`` for litellm; default forces one tool call per turn."""
+    if "MINI_AGENT_TOOL_CHOICE" not in os.environ:
+        return {"tool_choice": "required"}
+    raw = os.environ["MINI_AGENT_TOOL_CHOICE"].strip()
+    if raw.lower() in ("", "no", "none", "false", "0", "off", "unset"):
+        return {}
+    return {"tool_choice": raw}
+
+
+# LitellmModel parses OpenAI ``bash`` tool_calls only — not ```mswea_bash_command``` fences from default.yaml.
+_MINI_LLM_SYSTEM_TEMPLATE = """\
+You are a helpful assistant that can interact with a computer.
+
+Every turn you MUST call the provided `bash` tool exactly once. The runtime does not execute
+markdown, prose-only answers, or ```mswea_bash_command``` code fences — only the `bash` tool call
+runs shell commands.
+
+Pass a JSON object with a single key: `command` (the shell string). You may add brief reasoning
+in normal assistant text, but the action that runs is always the `bash` tool call.
+
+Rules for `command`:
+- It runs with shell=True in the workspace directory given in the task message.
+- Combine steps with `&&` or `||` on one line when needed.
+- MCP tools: start the command with `mcp_call <server> <tool> '<JSON>'` (see task message for servers).
+- To finish the task, your **last** `bash` call must be **only**: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+  (do not chain other commands on that final step).
+"""
+
+_MINI_LLM_FORMAT_ERROR_TEMPLATE = """\
+Format error:
+
+<error>
+{{error}}
+</error>
+
+The API requires a **`bash` tool call** with JSON like: {"command": "your shell command here"}.
+Your last response had {{actions|length}} tool call(s) (need exactly one valid `bash` call).
+
+Do not use markdown code fences for commands; they are ignored.
+
+To abandon the task early (only if appropriate), call `bash` with:
+{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}
+"""
+
+_MINI_LLM_INSTANCE_TEMPLATE = """\
+Please solve this issue: {{task}}
+
+Execute work by calling the **`bash` tool** each turn (see system message). Optional MCP lines use
+`mcp_call` inside the shell command string.
+
+## Recommended workflow
+
+1. Analyze the codebase by finding and reading relevant files.
+2. Create a small script or command to reproduce the issue when practical.
+3. Edit the source code to resolve the issue.
+4. Verify the fix (run targeted tests or your repro).
+5. Commit when ready (`mcp_call git ...` or the platform `git` CLI in `bash`).
+6. Finish by calling `bash` with command exactly: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+   (that step alone; after that you cannot continue).
+
+## Important rules
+
+1. One `bash` tool call per turn — no prose-only replies.
+2. Directory changes are not persistent across turns; use `cd /path && ...` in `command` when needed.
+
+<system_information>
+{{system}} {{release}} {{version}} {{machine}}
+</system_information>
+
+## Useful patterns (inside the `command` string)
+
+### Create / overwrite a file
+
+Use heredoc or your platform's file redirection inside the `command` value.
+
+### Edit with sed
+
+{% if system == "Darwin" %}
+<important>
+You are on macOS: use `sed -i ''` for in-place edits.
+</important>
+{% endif %}
+
+Example: `sed -i 's/old/new/g' path/to/file.py` (on Linux/Git Bash). On macOS use `sed -i '' 's/old/new/g' ...`.
+
+### View part of a file
+
+Example: `nl -ba path/to/file.py | sed -n '10,30p'`
+"""
+
+
+def _apply_litellm_tool_templates(agent_cfg: dict[str, Any], model_cfg: dict[str, Any]) -> None:
+    """Align prompts with LitellmModel (tool calls), overriding incompatible default.yaml fences."""
+    agent_cfg["system_template"] = _MINI_LLM_SYSTEM_TEMPLATE
+    agent_cfg["instance_template"] = _MINI_LLM_INSTANCE_TEMPLATE
+    model_cfg["format_error_template"] = _MINI_LLM_FORMAT_ERROR_TEMPLATE
+    merged_mk = dict(model_cfg.get("model_kwargs") or {})
+    merged_mk.update(_tool_choice_for_litellm())
+    model_cfg["model_kwargs"] = merged_mk
 
 
 # ---------------------------------------------------------------------------
@@ -424,10 +544,12 @@ class _MiniEngineerAgent(BaseChatAgent):
         agent_cfg["cost_limit"] = _resolve_cost_limit()
         agent_cfg["step_limit"] = _resolve_step_limit()
         agent_cfg["output_path"] = traj_path
+        _apply_litellm_tool_templates(agent_cfg, model_cfg)
 
         workspace = os.environ.get("MAS_WORKSPACE_PATH", CODE_PATH)
         env_cfg.setdefault("env", {})
         env_cfg["cwd"] = workspace
+        _resolve_mini_cmd_timeout(env_cfg)
 
         model_name = _resolve_model_name()
         logger.info(

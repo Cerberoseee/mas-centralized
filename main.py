@@ -167,18 +167,29 @@ async def start_sdlc(idea: str, rounds: int = 20) -> str:
         return final_message
 
 
-def _write_patch_if_configured() -> str | None:
+def _write_patch_if_configured(base_commit: str | None = None) -> str | None:
     patch_path = os.environ.get("MAS_EVAL_PATCH_PATH")
     workspace = os.environ.get("MAS_WORKSPACE_PATH")
     if not patch_path or not workspace:
         return None
+    diff_cmd = ["git", "diff"]
+    if base_commit:
+        diff_cmd = ["git", "diff", f"{base_commit}..HEAD"]
     diff = subprocess.run(
-        ["git", "diff"],
+        diff_cmd,
         cwd=workspace,
         capture_output=True,
         text=True,
         check=False,
     ).stdout
+    if not diff:
+        diff = subprocess.run(
+            ["git", "diff"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
     Path(patch_path).write_text(diff, encoding="utf-8")
     return patch_path
 
@@ -205,7 +216,7 @@ def run_swebench(task_path: str, rounds: int = 100) -> None:
     reset_telemetry()
     task = load_task_context(task_path)
     result = asyncio.run(start_sdlc(build_task_prompt(task), rounds=rounds))
-    patch_path = _write_patch_if_configured()
+    patch_path = _write_patch_if_configured(task.get("base_commit"))
     set_final_status("success")
     _write_result(result, patch_path)
     write_if_configured()
