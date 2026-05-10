@@ -20,12 +20,12 @@ def resolve_base_model_name() -> str:
        every ``.env``. Only ever set when running through the pipeline.
     2. ``AUTOGEN_MODEL`` — legacy per-process / ``.env`` override. Still honored
        when running outside the pipeline.
-    3. ``"gpt-4o"`` — fallback default.
+    3. ``"gpt-5-mini"`` — fallback default.
     """
     return (
         os.environ.get("MAS_EVAL_BASE_MODEL")
         or os.environ.get("AUTOGEN_MODEL")
-        or "gpt-4o"
+        or "gpt-5-mini"
     )
 
 

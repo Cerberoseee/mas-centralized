@@ -41,6 +41,7 @@ from agents import ProjectManager, Engineer, CodeReviewer, QA
 from agents.config import ensure_workspace_dirs
 from core.mcp_client import MCPClientPool
 from core.mcp_config import ROLE_SERVERS
+from core.swarm_loop_guard import build_swarm_loop_guard_termination
 from core.swebench import build_task_prompt, load_task_context
 from core.telemetry import record_handoff, record_message, reset as reset_telemetry, set_final_status, write_if_configured
 
@@ -117,10 +118,15 @@ async def start_sdlc(idea: str, rounds: int = 20) -> str:
 
         # --- Termination conditions ---
         # Stop when the PM says the project is complete OR we hit the round cap.
+        # Optional monopoly guard: Swarm keeps one speaker until a handoff; see
+        # core.swarm_loop_guard for per-agent message limits (env configurable).
         termination = (
             TextMentionTermination("PROJECT COMPLETE")
             | MaxMessageTermination(max_messages=rounds)
         )
+        swarm_guard = build_swarm_loop_guard_termination()
+        if swarm_guard is not None:
+            termination |= swarm_guard
 
         # --- Hub-and-spoke team (Swarm) ---
         # Swarm routes control via HandoffMessage: PM uses transfer_to_* tools

@@ -102,12 +102,12 @@ def _resolve_model_name() -> str:
 def _resolve_cost_limit() -> float:
     raw = os.environ.get("MINI_AGENT_COST_LIMIT")
     if raw is None:
-        return 3.0
+        return 1.0
     try:
         return float(raw)
     except ValueError:
-        logger.warning("Invalid MINI_AGENT_COST_LIMIT=%r, using 3.0", raw)
-        return 3.0
+        logger.warning("Invalid MINI_AGENT_COST_LIMIT=%r, using 1.0", raw)
+        return 1.0
 
 
 def _resolve_step_limit() -> int:

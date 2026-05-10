@@ -108,8 +108,8 @@ AUTOGEN_MODEL=gpt-4o
 # LLM temperature (default: 0.1)
 AUTOGEN_TEMPERATURE=0.1
 
-# Optional: cost ceiling per mini-swe-agent run, in USD (default: 3.0).
-# MINI_AGENT_COST_LIMIT=3.0
+# Optional: cost ceiling per mini-swe-agent run, in USD (default: 1.0).
+# MINI_AGENT_COST_LIMIT=1.0
 
 # Optional: hard step ceiling per mini-swe-agent run (default: 0 = unlimited).
 # MINI_AGENT_STEP_LIMIT=0
