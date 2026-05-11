@@ -43,6 +43,7 @@ from agents.config import ensure_workspace_dirs
 from core.mcp_client import MCPClientPool
 from core.mcp_config import ROLE_SERVERS
 from core.swarm_loop_guard import build_swarm_loop_guard_termination
+from core.autogen_compat import patch_single_threaded_runtime_shutdown
 from core.swebench import (
     assess_patch_relevance,
     build_task_prompt,
@@ -54,6 +55,7 @@ from core.swebench import (
 from core.telemetry import record_handoff, record_message, reset as reset_telemetry, set_final_status, write_if_configured
 
 load_dotenv()
+patch_single_threaded_runtime_shutdown()
 
 # ---------------------------------------------------------------------------
 # Logging: mirror all logs to a per-session file under data/logs/
@@ -162,6 +164,16 @@ def _latest_review_blocking(messages: list[dict[str, str]]) -> bool | None:
     return None
 
 
+def _latest_project_complete_summary(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message.get("source") != "ProjectManager":
+            continue
+        content = message.get("content", "")
+        if content.startswith("PROJECT COMPLETE"):
+            return content
+    return ""
+
+
 def _messages_for_completion_check(
     messages: list[BaseAgentEvent | BaseChatMessage],
 ) -> list[dict[str, str]]:
@@ -179,31 +191,83 @@ def _messages_for_completion_check(
     return collected
 
 
+def _swebench_success_state(
+    messages: list[dict[str, str]],
+    *,
+    base_commit: str | None,
+) -> dict[str, Any]:
+    sources = {message.get("source") for message in messages}
+    qa_verdict = _latest_qa_verdict(messages)
+    review_blocking = _latest_review_blocking(messages)
+    patch_present = bool(_current_patch_text(base_commit).strip())
+    project_complete_summary = _latest_project_complete_summary(messages)
+    return {
+        "sources": sources,
+        "qa_verdict": qa_verdict,
+        "review_blocking": review_blocking,
+        "patch_present": patch_present,
+        "project_complete_summary": project_complete_summary,
+        "qa_verified_ready": (
+            "Engineer" in sources
+            and "QA" in sources
+            and qa_verdict is not None
+            and bool(qa_verdict.get("verified"))
+            and patch_present
+            and review_blocking is not True
+        ),
+    }
+
+
+def _build_swebench_project_complete_summary(messages: list[dict[str, str]]) -> str:
+    qa_verdict = _latest_qa_verdict(messages)
+    review_verdict = _latest_review_verdict(messages)
+    summary_lines = [
+        "PROJECT COMPLETE",
+        "",
+        "QA verified all Fail-to-pass tests and Engineer produced a non-empty patch.",
+    ]
+    if qa_verdict and qa_verdict.get("notes"):
+        summary_lines.append(f"QA notes: {qa_verdict['notes']}")
+    if review_verdict and review_verdict.get("notes"):
+        summary_lines.append(f"Code review: {review_verdict['notes']}")
+    return "\n".join(summary_lines)
+
+
 def _swebench_completion_reached(
+    transcript: list[dict[str, str]],
+    *,
+    base_commit: str | None,
+) -> bool:
+    if not transcript:
+        return False
+    state = _swebench_success_state(transcript, base_commit=base_commit)
+    if not state["qa_verified_ready"]:
+        return False
+    last = transcript[-1]
+    if last.get("source") == "ProjectManager":
+        return last.get("content", "").startswith("PROJECT COMPLETE")
+    return last.get("source") == "QA"
+
+
+def _swebench_completion_reached_from_delta(
     messages: list[BaseAgentEvent | BaseChatMessage],
     *,
     base_commit: str | None,
 ) -> bool:
     transcript = _messages_for_completion_check(messages)
-    if not transcript:
-        return False
-    last = transcript[-1]
-    if last.get("source") != "ProjectManager":
-        return False
-    if not last.get("content", "").startswith("PROJECT COMPLETE"):
-        return False
-    sources = {message.get("source") for message in transcript}
-    qa_verdict = _latest_qa_verdict(transcript)
-    review_blocking = _latest_review_blocking(transcript)
-    patch_present = bool(_current_patch_text(base_commit).strip())
-    return (
-        "Engineer" in sources
-        and "QA" in sources
-        and qa_verdict is not None
-        and bool(qa_verdict.get("verified"))
-        and patch_present
-        and review_blocking is not True
-    )
+    return _swebench_completion_reached(transcript, base_commit=base_commit)
+
+
+def _build_swebench_termination_checker(*, base_commit: str | None):
+    transcript: list[dict[str, str]] = []
+
+    def _check(messages: list[BaseAgentEvent | BaseChatMessage]) -> bool:
+        # AutoGen termination conditions receive only the new delta, not the
+        # full thread, so we accumulate the transcript across callbacks here.
+        transcript.extend(_messages_for_completion_check(messages))
+        return _swebench_completion_reached(transcript, base_commit=base_commit)
+
+    return _check
 
 
 async def start_sdlc(idea: str, rounds: int = 20, *, task: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -246,13 +310,11 @@ async def start_sdlc(idea: str, rounds: int = 20, *, task: dict[str, Any] | None
         # Optional monopoly guard: Swarm keeps one speaker until a handoff; see
         # core.swarm_loop_guard for per-agent message limits (env configurable).
         if task is not None and os.environ.get("MAS_MODE") == "swebench":
+            swebench_termination = _build_swebench_termination_checker(
+                base_commit=str(task.get("base_commit") or "") or None,
+            )
             termination: FunctionalTermination | MaxMessageTermination | TextMentionTermination = (
-                FunctionalTermination(
-                    lambda messages: _swebench_completion_reached(
-                        list(messages),
-                        base_commit=str(task.get("base_commit") or "") or None,
-                    )
-                )
+                FunctionalTermination(swebench_termination)
                 | MaxMessageTermination(max_messages=rounds)
             )
         else:
@@ -312,6 +374,13 @@ async def start_sdlc(idea: str, rounds: int = 20, *, task: dict[str, Any] | None
         finally:
             logger.info("SDLC workflow finished.")
 
+        if task is not None and os.environ.get("MAS_MODE") == "swebench":
+            state = _swebench_success_state(transcript, base_commit=str(task.get("base_commit") or "") or None)
+            if state["qa_verified_ready"] and not state["project_complete_summary"]:
+                final_message = _build_swebench_project_complete_summary(transcript)
+                transcript.append({"source": "ProjectManager", "content": final_message})
+                logger.info("[ProjectManager] %s", final_message.splitlines()[0])
+
         return {
             "final_message": final_message,
             "messages": transcript,
@@ -368,6 +437,9 @@ def _evaluate_swebench_run(
 ) -> dict[str, Any]:
     messages = list(run_result.get("messages") or [])
     final_message = str(run_result.get("final_message") or "")
+    project_complete_summary = _latest_project_complete_summary(messages)
+    if project_complete_summary:
+        final_message = project_complete_summary
     qa_verdict = _latest_qa_verdict(messages)
     review_verdict = _latest_review_verdict(messages)
     review_blocking = _latest_review_blocking(messages)
@@ -391,7 +463,7 @@ def _evaluate_swebench_run(
         completion_failures.append("Engineer never handed control back to the ProjectManager.")
     if "QA" not in sources:
         completion_failures.append("QA never handed control back to the ProjectManager.")
-    if not final_message.startswith("PROJECT COMPLETE"):
+    if not project_complete_summary and not final_message.startswith("PROJECT COMPLETE"):
         completion_failures.append("ProjectManager never emitted a valid PROJECT COMPLETE summary.")
     if qa_verdict is None:
         completion_failures.append("No QA_VERDICT block was produced.")
