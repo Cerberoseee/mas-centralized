@@ -13,7 +13,7 @@ from autogen_agentchat.base import Handoff
 
 from core.autogen_config import get_model_client
 from core.mcp_client import MCPClientPool
-from core.mcp_tools import BOARD_TOOLS, DOCS_TOOLS, bind_tools
+from core.mcp_tools import BOARD_TOOLS, DOCS_TOOLS, PATCH_TOOLS, bind_tools
 from core.swebench import get_role_system_message
 
 
@@ -91,7 +91,7 @@ class ProjectManager:
         self.agent = AssistantAgent(
             name="ProjectManager",
             model_client=get_model_client(),
-            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS),
+            tools=bind_tools(pool, *BOARD_TOOLS, *DOCS_TOOLS, *PATCH_TOOLS),
             handoffs=[
                 Handoff(target="Engineer", description="Delegate implementation to the Engineer."),
                 Handoff(target="CodeReviewer", description="Delegate code review to the CodeReviewer."),

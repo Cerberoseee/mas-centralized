@@ -4,8 +4,32 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
+
+_QA_VERDICT_BOOL_RE = re.compile(r"verified:\s*(true|false)", re.IGNORECASE)
+_REVIEW_VERDICT_BOOL_RE = re.compile(r"blocking_findings:\s*(true|false)", re.IGNORECASE)
+_DIFF_FILE_RE = re.compile(r"^\+\+\+\s+b/(.+)$", re.MULTILINE)
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
+_PATH_RE = re.compile(
+    r"(?<![\w/])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:py|pyi|txt|rst|md|ini|cfg|toml|yaml|yml|json)"
+)
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
+_PATH_TOKEN_SPLIT_RE = re.compile(r"[\/_.-]+")
+_TOKEN_STOPWORDS = {
+    "test",
+    "tests",
+    "testing",
+    "src",
+    "lib",
+    "python",
+    "py",
+}
+_SUSPICIOUS_TOP_LEVEL_FILES = {
+    "sitecustomize.py",
+    "usercustomize.py",
+}
 
 
 ROLE_MESSAGES = {
@@ -20,12 +44,18 @@ Rules:
 - Break the issue into small actionable tickets on the project board.
 - Route to specialists using transfer_to_* tools only.
 - Prefer direct implementation and validation over broad redesign.
+- In SWE-bench mode, planning alone is never completion. Do not ask the user whether to continue.
+- Completion is INVALID unless the run included an Engineer handoff and a QA handoff.
+- Do not create "update tests" tickets just because Fail-to-pass tests are named.
+- Assume the harness already applied the gold test patch; implementation changes are the default path unless QA proves otherwise.
+- Default routing is Engineer -> QA -> ProjectManager. Involve CodeReviewer when the diff still needs a correctness or scope check, but do not let a diff-shape objection override a passing QA verdict without a concrete implementation bug.
+- Before declaring completion, confirm there is a non-empty patch via `read_patch_diff`.
 - When the issue is resolved and validated, produce a final summary starting with: PROJECT COMPLETE
 
 Reading QA results:
 - When QA hands back to you, look for the QA_VERDICT block in their message.
 - You MUST read verified: true or verified: false from that block before deciding next steps.
-- If verified: true — the fix is confirmed; you may issue PROJECT COMPLETE.
+- If verified: true — the fix is confirmed; you may issue PROJECT COMPLETE only after confirming the Engineer produced a non-empty patch.
 - If verified: false — do NOT declare PROJECT COMPLETE. Route back to the Engineer
   with the failing_ids and notes from the QA_VERDICT so they can address the gaps.
 - If QA's message contains no QA_VERDICT block, ask QA to re-run and provide one
@@ -37,6 +67,9 @@ Reading QA results:
   patch introduced a SyntaxError / ImportError that breaks collection, or
   (b) you accidentally edited a test file. Run `pytest --collect-only` to
   diagnose, then ensure your patch only touches implementation code."
+
+Reading reviewer results:
+- If CodeReviewer provides a REVIEW_VERDICT block with blocking_findings: true, do NOT declare PROJECT COMPLETE; route back to the Engineer with those findings.
 """,
     "architect": """\
 You are Bob, the Architect for a SWE-bench bug-fix workflow.
@@ -78,6 +111,13 @@ Strict rules about test files:
   test code yourself.
 - You MAY run `pytest --collect-only <test_file>` to confirm the gold IDs
   are present; treat any missing ID as a harness problem, not a coding task.
+- If the task lists Fail-to-pass IDs, you MUST validate in this order:
+  1. run `pytest --collect-only <test_file>` for each referenced fail-to-pass file
+  2. run only the listed Fail-to-pass IDs
+  3. once those pass, run the listed Pass-to-pass IDs
+  4. only after the targeted IDs pass may you broaden scope further
+- Do NOT pivot to unrelated failures from `pytest -q`, a full suite, or a different file until the listed Fail-to-pass IDs have been collected and exercised first.
+- If you use `mcp_call`, it must be the ENTIRE shell command for that turn. Do not chain it with `&&`, `;`, pipes, or other bash commands.
 
 IMPORTANT — safe file editing for IMPLEMENTATION files:
 The repo lives inside the SWE-bench Docker container at /testbed; host MCP
@@ -119,7 +159,16 @@ Rules:
 - You MUST call `read_patch_diff` before forming any opinion — do not approve or reject without seeing the diff.
 - If `read_patch_diff` returns empty or an error, report that to the ProjectManager and ask them to re-route to the Engineer.
 - Approve only if the diff directly addresses the stated bug with minimal scope.
+- In SWE-bench, do NOT require test-file edits unless the task explicitly asks for test changes.
+- Treat QA's targeted verification as strong evidence. If QA already verified all Fail-to-pass IDs pass, prefer approval unless you found a real implementation bug or clearly unrelated patch scope.
 - Reject (and list specific line-level findings) if the fix is incorrect, incomplete, or overly broad.
+
+Structured sign-off:
+At the end of your review, include a REVIEW_VERDICT block in your message with exactly this format:
+
+REVIEW_VERDICT:
+  blocking_findings: true | false
+  notes: <brief summary>
 """,
     "qa": """\
 You are Eve, the QA Engineer for a SWE-bench bug-fix workflow.
@@ -205,3 +254,179 @@ def build_task_prompt(task: dict[str, Any]) -> str:
         f"Fail-to-pass tests:\n{fail_to_pass}\n\n"
         f"Pass-to-pass tests:\n{pass_to_pass}\n"
     )
+
+
+def parse_qa_verdict(message: str) -> dict[str, Any] | None:
+    if "QA_VERDICT:" not in message:
+        return None
+    block = message.split("QA_VERDICT:", 1)[1]
+    verified_match = _QA_VERDICT_BOOL_RE.search(block)
+    if not verified_match:
+        return None
+    notes_match = re.search(r"notes:\s*(.+)", block)
+    failing_ids: list[str] = []
+    if "failing_ids:" in block:
+        failing_block = block.split("failing_ids:", 1)[1]
+        failing_block = failing_block.split("notes:", 1)[0]
+        failing_ids = [
+            line.strip()[2:].strip()
+            for line in failing_block.splitlines()
+            if line.strip().startswith("- ")
+        ]
+    return {
+        "verified": verified_match.group(1).lower() == "true",
+        "failing_ids": failing_ids,
+        "notes": notes_match.group(1).strip() if notes_match else "",
+        "raw": block.strip(),
+    }
+
+
+def parse_review_verdict(message: str) -> dict[str, Any] | None:
+    if "REVIEW_VERDICT:" not in message:
+        return None
+    block = message.split("REVIEW_VERDICT:", 1)[1]
+    verdict_match = _REVIEW_VERDICT_BOOL_RE.search(block)
+    if not verdict_match:
+        return None
+    notes_match = re.search(r"notes:\s*(.+)", block)
+    return {
+        "blocking_findings": verdict_match.group(1).lower() == "true",
+        "notes": notes_match.group(1).strip() if notes_match else "",
+        "raw": block.strip(),
+    }
+
+
+def infer_review_blocking(message: str) -> bool | None:
+    verdict = parse_review_verdict(message)
+    if verdict is not None:
+        return bool(verdict["blocking_findings"])
+    lowered = message.lower()
+    if "no blocking findings" in lowered or "approve" in lowered or "approved" in lowered:
+        return False
+    if "blocking finding" in lowered or "blocking findings" in lowered or "reject" in lowered:
+        return True
+    return None
+
+
+def extract_changed_files_from_patch_text(patch_text: str) -> list[str]:
+    seen: set[str] = set()
+    files: list[str] = []
+    for match in _DIFF_GIT_RE.finditer(patch_text):
+        candidate = match.group(2).strip()
+        if candidate != "/dev/null" and candidate not in seen:
+            seen.add(candidate)
+            files.append(candidate)
+    for match in _DIFF_FILE_RE.finditer(patch_text):
+        candidate = match.group(1).strip()
+        if candidate != "/dev/null" and candidate not in seen:
+            seen.add(candidate)
+            files.append(candidate)
+    return files
+
+
+def assess_patch_relevance(task: dict[str, Any], patch_text: str) -> dict[str, Any]:
+    changed_files = extract_changed_files_from_patch_text(patch_text)
+    relevant_files: list[str] = []
+    suspicious_files: list[str] = []
+    if not changed_files:
+        return {
+            "acceptable": False,
+            "changed_files": [],
+            "relevant_files": [],
+            "suspicious_files": [],
+            "notes": ["Patch diff is empty."],
+        }
+
+    context_text = "\n".join(
+        [
+            str(task.get("problem_statement") or ""),
+            str(task.get("hints_text") or ""),
+            "\n".join(task.get("fail_to_pass", []) or []),
+            "\n".join(task.get("pass_to_pass", []) or []),
+        ]
+    )
+    explicit_paths = set(_PATH_RE.findall(context_text))
+    explicit_tokens = set()
+    for path in explicit_paths:
+        explicit_tokens.update(_path_tokens(path))
+
+    test_tokens = set()
+    for test_id in [*(task.get("fail_to_pass", []) or []), *(task.get("pass_to_pass", []) or [])]:
+        test_file = str(test_id).split("::", 1)[0]
+        test_tokens.update(_path_tokens(test_file))
+
+    problem_tokens = {
+        token.lower()
+        for token in _WORD_RE.findall(context_text)
+        if len(token) >= 4
+    }
+
+    for changed in changed_files:
+        score = _score_patch_file(
+            changed,
+            explicit_paths=explicit_paths,
+            explicit_tokens=explicit_tokens,
+            test_tokens=test_tokens,
+            problem_tokens=problem_tokens,
+        )
+        if score > 0:
+            relevant_files.append(changed)
+        else:
+            suspicious_files.append(changed)
+
+    suspicious_top_level = [
+        path for path in suspicious_files if "/" not in path and path in _SUSPICIOUS_TOP_LEVEL_FILES
+    ]
+    acceptable = bool(relevant_files) or not suspicious_top_level
+
+    notes: list[str] = []
+    if suspicious_top_level and not relevant_files:
+        notes.append(
+            "Patch only touched suspicious top-level shim files with no clear overlap to the issue, hints, or targeted tests."
+        )
+    elif suspicious_files:
+        notes.append(
+            "Some changed files do not clearly overlap with the issue statement, hints, or targeted tests."
+        )
+
+    return {
+        "acceptable": acceptable,
+        "changed_files": changed_files,
+        "relevant_files": relevant_files,
+        "suspicious_files": suspicious_files,
+        "notes": notes,
+    }
+
+
+def _path_tokens(path: str) -> set[str]:
+    normalized = path.strip().split("::", 1)[0].lower()
+    parts = [part for part in _PATH_TOKEN_SPLIT_RE.split(normalized) if part]
+    tokens: set[str] = set()
+    for part in parts:
+        if part.startswith("test") and len(part) > 4:
+            part = part[4:]
+        if part and part not in _TOKEN_STOPWORDS:
+            tokens.add(part)
+    return tokens
+
+
+def _score_patch_file(
+    changed_file: str,
+    *,
+    explicit_paths: set[str],
+    explicit_tokens: set[str],
+    test_tokens: set[str],
+    problem_tokens: set[str],
+) -> int:
+    normalized = changed_file.lower()
+    tokens = _path_tokens(normalized)
+    score = 0
+    if normalized in {path.lower() for path in explicit_paths}:
+        score += 3
+    if tokens & explicit_tokens:
+        score += 2
+    if tokens & test_tokens:
+        score += 1
+    if tokens & problem_tokens:
+        score += 1
+    return score

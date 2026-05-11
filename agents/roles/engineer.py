@@ -29,6 +29,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -51,7 +52,7 @@ from autogen_core import CancellationToken
 
 from core.mcp_client import MCPClientPool
 from core.mcp_config import BOARD_PATH, CODE_PATH, DOCS_PATH, ROLE_SERVERS
-from core.swebench import get_role_system_message
+from core.swebench import extract_changed_files_from_patch_text, get_role_system_message
 from core.telemetry import record_tool_event
 
 logger = logging.getLogger(__name__)
@@ -329,7 +330,7 @@ Rules for `command`:
 - It runs with **bash** (POSIX), not plain `sh`, so `source venv/bin/activate` works when needed.
 - If the workspace has `venv/` or `.venv/`, that environment's `bin` is prepended to `PATH` for each command (after it exists), so `pip`/`pytest` match the project interpreter—avoid bare system `pip` on PEP 668 hosts.
 - Combine steps with `&&` or `||` on one line when needed.
-- MCP tools: start the command with `mcp_call <server> <tool> '<JSON>'` (see task message for servers).
+- MCP tools: `mcp_call <server> <tool> '<JSON>'` must be the ENTIRE command for that turn. Do not chain it with bash via `&&`, `;`, pipes, or subshells.
 - **Never** run `git push` — there is no remote; commits stay local only.
 - To finish the task, your **last** `bash` call must be **only**: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
   (do not chain other commands on that final step).
@@ -355,16 +356,18 @@ _MINI_LLM_INSTANCE_TEMPLATE = """\
 Please solve this issue: {{task}}
 
 Execute work by calling the **`bash` tool** each turn (see system message). Optional MCP lines use
-`mcp_call` inside the shell command string.
+`mcp_call` as the entire shell command string for that turn.
 
 ## Recommended workflow
 
 1. Analyze the codebase by finding and reading relevant files.
-2. Create a small script or command to reproduce the issue when practical.
-3. Edit the source code to resolve the issue.
-4. Verify the fix (run targeted tests or your repro).
-5. Commit when ready (`mcp_call git ...` or the platform `git` CLI in `bash`). Do **not** push — there is no remote.
-6. Finish by calling `bash` with command exactly: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+2. If the task lists Fail-to-pass IDs, run `pytest --collect-only <test_file>` for each referenced file before broader execution.
+3. Run only the listed Fail-to-pass IDs until they pass.
+4. Once Fail-to-pass IDs pass, run the listed Pass-to-pass IDs.
+5. Edit the source code to resolve the issue without touching tests.
+6. Verify the fix with the smallest targeted commands first; do not pivot to unrelated broad-suite failures before the listed IDs pass.
+7. Commit when ready (`mcp_call git ...` or the platform `git` CLI in `bash`). Do **not** push — there is no remote.
+8. Finish by calling `bash` with command exactly: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
    (that step alone; after that you cannot continue).
 
 ## Important rules
@@ -720,7 +723,10 @@ class MCPLocalEnvironment(_MCPDispatchMixin, LocalEnvironment):
         self._loop_guard.raise_if_tripped()
 
         command = (action.get("command") or "").lstrip()
-        if command.startswith("mcp_call"):
+        embedded_mcp_error = _embedded_mcp_call_error(command)
+        if embedded_mcp_error is not None:
+            result = embedded_mcp_error
+        elif command.startswith("mcp_call"):
             result = self._handle_mcp_call(command)
         else:
             result = self._execute_shell_like_local_env(action, cwd, timeout=timeout)
@@ -820,7 +826,10 @@ class MCPDockerEnvironment(_MCPDispatchMixin, DockerEnvironment):
         self._loop_guard.raise_if_tripped()
 
         command = (action.get("command") or "").lstrip()
-        if command.startswith("mcp_call"):
+        embedded_mcp_error = _embedded_mcp_call_error(command)
+        if embedded_mcp_error is not None:
+            result = embedded_mcp_error
+        elif command.startswith("mcp_call"):
             result = self._handle_mcp_call(command)
         else:
             # Route to DockerEnvironment.execute → docker exec … bash -lc
@@ -880,7 +889,7 @@ def _build_paths_block() -> str:
 def _build_mcp_block() -> str:
     return (
         "## MCP tools (in addition to bash)\n"
-        "You can issue MCP tool calls as actions. Syntax:\n\n"
+        "You can issue MCP tool calls as actions. The entire command for that turn must be the MCP call. Syntax:\n\n"
         "    mcp_call <server> <tool> '<JSON_ARGS>'\n\n"
         "Available servers (and their scope):\n"
         "- fs_board  →  data/project_board/   (tickets and the index)\n"
@@ -899,8 +908,8 @@ def _build_mcp_block() -> str:
         "    mcp_call git git_status '{}'\n"
         "    mcp_call git git_add '{\"files\":[\"main.py\"]}'\n"
         "    mcp_call git git_commit '{\"message\":\"feat: implement T-XXX\"}'\n\n"
-        "Bash and mcp_call coexist — pick whichever is more ergonomic per\n"
-        "step. Direct git CLI commands also work (the workspace IS a git repo).\n"
+        "Use plain bash for shell work and a standalone `mcp_call ...` command for MCP work.\n"
+        "Direct git CLI commands also work (the workspace IS a git repo).\n"
     )
 
 
@@ -926,6 +935,132 @@ def _build_task_prompt(messages: Sequence[BaseChatMessage]) -> str:
         "## Incoming request from the team\n"
         f"{_format_messages_for_task(messages)}\n"
     )
+
+
+_RETURNCODE_RE = re.compile(r"<returncode>(-?\d+)</returncode>")
+_PYTEST_SUMMARY_RE = re.compile(
+    r"(^=+.*?(?:passed|failed|error|errors|deselected|collected).*$|^\d+ .*?(?:passed|failed|error|errors|deselected|collected).*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _embedded_mcp_call_error(command: str) -> dict[str, Any] | None:
+    stripped = command.lstrip()
+    if "mcp_call" not in stripped or stripped.startswith("mcp_call"):
+        return None
+    return {
+        "output": (
+            "mcp_call ERROR: `mcp_call` must be the entire command for that turn. "
+            "Run shell work in one bash step, then issue a separate command starting with "
+            "`mcp_call <server> <tool> '<JSON_ARGS>'`."
+        ),
+        "returncode": 2,
+        "exception_info": "",
+    }
+
+
+def _read_patch_text() -> str:
+    patch_path = os.environ.get("MAS_EVAL_PATCH_PATH", "").strip()
+    if not patch_path:
+        return ""
+    try:
+        return Path(patch_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        logger.warning("[Engineer/mini] Could not read patch.diff at %s: %s", patch_path, exc)
+        return ""
+
+
+def _latest_commit_summary(
+    *,
+    docker_env: MCPDockerEnvironment | None,
+    workspace: str | None,
+) -> str:
+    if docker_env is not None:
+        result = subprocess.run(
+            ["docker", "exec", docker_env.container_id, "git", "log", "-1", "--format=%H %s"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    else:
+        if not workspace:
+            return ""
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%H %s"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _extract_pytest_snippets(traj_path: Path, limit: int = 3) -> list[str]:
+    try:
+        payload = json.loads(traj_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return []
+
+    snippets: list[str] = []
+    pending_command: str | None = None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for action in (message.get("extra") or {}).get("actions", []):
+                command = str(action.get("command") or "")
+                if "pytest" in command:
+                    pending_command = command
+        elif message.get("role") == "tool" and pending_command:
+            raw_output = str((message.get("extra") or {}).get("raw_output") or message.get("content") or "")
+            returncode_match = _RETURNCODE_RE.search(str(message.get("content") or ""))
+            returncode = returncode_match.group(1) if returncode_match else "?"
+            summary_lines = [line.strip() for line in _PYTEST_SUMMARY_RE.findall(raw_output)]
+            if not summary_lines:
+                first_line = next((line.strip() for line in raw_output.splitlines() if line.strip()), "")
+                if first_line:
+                    summary_lines = [first_line[:200]]
+            command_preview = pending_command if len(pending_command) <= 140 else pending_command[:137] + "..."
+            detail = "; ".join(summary_lines[:2]) if summary_lines else "no concise pytest summary captured"
+            snippets.append(f"pytest rc={returncode}: {command_preview} -> {detail}")
+            pending_command = None
+    return snippets[-limit:]
+
+
+def _build_fallback_submission(
+    *,
+    traj_path: Path,
+    exit_status: str,
+    docker_env: MCPDockerEnvironment | None,
+    workspace: str | None,
+) -> str:
+    patch_text = _read_patch_text()
+    changed_files = extract_changed_files_from_patch_text(patch_text)
+    latest_commit = _latest_commit_summary(docker_env=docker_env, workspace=workspace)
+    pytest_snippets = _extract_pytest_snippets(traj_path)
+
+    lines = [
+        f"Structured fallback summary: exit_status={exit_status or '?'}",
+        f"patch.diff present: {'yes' if bool(patch_text.strip()) else 'no'}",
+    ]
+    if changed_files:
+        lines.append("changed files: " + ", ".join(changed_files[:8]))
+    if latest_commit:
+        lines.append(f"latest commit: {latest_commit}")
+    if pytest_snippets:
+        lines.append("pytest checks:")
+        lines.extend(f"- {snippet}" for snippet in pytest_snippets)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1218,11 +1353,24 @@ class _MiniEngineerAgent(BaseChatAgent):
                 "trajectory": str(traj_path),
                 "n_calls": getattr(inner, "n_calls", 0),
                 "cost": getattr(inner, "cost", 0.0),
+                "fallback_submission": _build_fallback_submission(
+                    traj_path=traj_path,
+                    exit_status=type(exc).__name__,
+                    docker_env=env if isinstance(env, MCPDockerEnvironment) else None,
+                    workspace=None if isinstance(env, MCPDockerEnvironment) else env_cfg.get("cwd"),
+                ),
             }
 
         # Extract patch before the container is cleaned up.
         if isinstance(env, MCPDockerEnvironment):
             self._extract_patch_from_docker(env, initial_head=initial_head)
+
+        fallback_submission = _build_fallback_submission(
+            traj_path=traj_path,
+            exit_status=str(extra.get("exit_status", "")),
+            docker_env=env if isinstance(env, MCPDockerEnvironment) else None,
+            workspace=None if isinstance(env, MCPDockerEnvironment) else env_cfg.get("cwd"),
+        )
 
         return {
             "exit_status": extra.get("exit_status", ""),
@@ -1230,6 +1378,7 @@ class _MiniEngineerAgent(BaseChatAgent):
             "trajectory": str(traj_path),
             "n_calls": getattr(inner, "n_calls", 0),
             "cost": getattr(inner, "cost", 0.0),
+            "fallback_submission": fallback_submission,
         }
 
     # ------------------------------------------------------------------
@@ -1248,8 +1397,14 @@ class _MiniEngineerAgent(BaseChatAgent):
     @staticmethod
     def _format_summary(turn: int, elapsed: float, result: dict[str, Any]) -> str:
         submission = (result.get("submission") or "").strip()
+        fallback_submission = (result.get("fallback_submission") or "").strip()
         if len(submission) > 4000:
             submission = submission[:4000] + "\n... [truncated; see trajectory]"
+        if len(fallback_submission) > 4000:
+            fallback_submission = fallback_submission[:4000] + "\n... [truncated; see trajectory]"
+        effective_submission = submission or fallback_submission
+        if len(effective_submission) > 4000:
+            effective_submission = effective_submission[:4000] + "\n... [truncated; see trajectory]"
 
         exit_status = result.get("exit_status", "")
         success = exit_status == "Submitted"
@@ -1271,7 +1426,7 @@ class _MiniEngineerAgent(BaseChatAgent):
             f"trajectory: {result.get('trajectory')}",
             "",
             "Engineer summary:",
-            submission or "(no submission text returned)",
+            effective_submission or "(no submission text returned)",
         ]
         if "error" in result:
             lines.append("")
