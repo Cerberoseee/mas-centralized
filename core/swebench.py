@@ -31,6 +31,9 @@ _SUSPICIOUS_TOP_LEVEL_FILES = {
     "usercustomize.py",
 }
 
+# SWE-bench role overlays: keep ``architect``, ``engineer``, and ``qa`` strings
+# identical to ``mas-decentralized/core/swebench.py``. Hub vs mesh differs only
+# in ``project_manager`` and ``code_reviewer`` (decentralized mesh prompts).
 
 ROLE_MESSAGES = {
     "project_manager": """\
@@ -48,7 +51,7 @@ Rules:
 - Completion is INVALID unless the run included an Engineer handoff and a QA handoff.
 - Do not create "update tests" tickets just because Fail-to-pass tests are named.
 - Assume the harness already applied the gold test patch; implementation changes are the default path unless QA proves otherwise.
-- Default routing is Engineer -> QA -> ProjectManager. Involve CodeReviewer when the diff still needs a correctness or scope check, but do not let a diff-shape objection override a passing QA verdict without a concrete implementation bug.
+- Hub routing: default path is Engineer -> QA -> ProjectManager (you delegate each hop). Involve CodeReviewer when the diff still needs a correctness or scope check, but do not let a diff-shape objection override a passing QA verdict without a concrete implementation bug.
 - Before declaring completion, confirm there is a non-empty patch via `read_patch_diff`.
 - When the issue is resolved and validated, produce a final summary starting with: PROJECT COMPLETE
 
@@ -83,7 +86,7 @@ You are Charlie, the Engineer for a SWE-bench bug-fix workflow.
 You are working inside an existing repository checkout (your cwd). The
 Project Manager and Architect have described the failing issue and any
 relevant tests. Implement the minimal fix, validate it, commit it, and
-hand off to CodeReviewer.
+hand off to the ProjectManager (they coordinate CodeReviewer and QA next).
 
 Rules:
 - Do not scaffold a new project; the repository already exists.
